@@ -1,7 +1,7 @@
 import { LibGame, LibGroup } from "../types";
 import { viewerOpen } from "../glass";
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { deleteCollectionRoms, getConfig, getMostPlayed, getRecapDue, dismissRecap, playTimeSyncIfDue, getDownloadProgress, getHomeData, getLibraryGames, getLibraryGroups, getResumeStateEnabled, getServiceStatus, repairEmulatorPaths, searchGames, toggleCollectionSync, checkLibraryStale, refreshFromRomm} from "../rpc";
+import { deleteCollectionRoms, getConfig, getMostPlayed, getRecapDue, dismissRecap, playTimeSyncIfDue, getHomeData, getLibraryGames, getLibraryGroups, getResumeStateEnabled, getServiceStatus, repairEmulatorPaths, searchGames, toggleCollectionSync, checkLibraryStale, refreshFromRomm} from "../rpc";
 import { CardRow, CollectionTile, GameTile, PlatformTile, _resumeStatesPref, _setResumeStatesPref, _stateThumbListeners, _stateThumbs, loadStateThumbs, tileElFor} from "../tiles";
 import { _autoFocusFirstRef, _forceGamepadFocus, _gpFocusEl, playSteamSound, returnFocusRomId, setReturnFocusTarget, useAutoFocus } from "../shell";
 import { Bumper, GameActionButton, V2SearchField, useEtaFromPct, Shimmer} from "../kit";
@@ -29,7 +29,7 @@ import { _LS_REOPEN_HOME } from "../storage";
 import { lastLaunchedRomId } from "../launch";
 import { CollectionActionsModal, NAV_ORDER, UserMenuModal, V2NavBar, useNavChrome } from "../topbar";
 import { v2Page, V2Focus } from "../focus";
-import { _dlActive, runCollectionBatch, useBatchJob } from "../downloads";
+import { _dlActive, onProgress, progressOf, runCollectionBatch, useBatchJob, watchProgress } from "../downloads";
 import { EmuStalePath, InstallProgressBar, installSize, loadEmulatorStatus, publishEmulatorStatus, startEmulatorInstall, useEmulatorInstall, useEmulatorStatus } from "../emulator";
 // The library: home, platforms, collections, search, and the grid underneath.
 //
@@ -916,6 +916,8 @@ export function HomePanel({ onOpen, onOpenGroup, onBg, visible }:
   );
 }
 
+const GROUPS_FIRST = 48, GROUPS_CHUNK = 36;
+
 export function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
   { mode: 'platform' | 'collection'; visible: boolean; onOpenGroup: (mode: string, g: LibGroup, gs: LibGroup[]) => void; svcStatus: any }) {
   const c0 = _groupsCache[mode];
@@ -1001,6 +1003,29 @@ export function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
         .flatMap((kinds) => groups.filter((g) => kinds.includes(g.kind || 'collection')));
   const orderRef = useRef<LibGroup[]>(order);
   orderRef.current = order;
+  // Windowed mount (collection mode): RomM can autogenerate hundreds of virtual
+  // collections, and this panel stays mounted (hidden) after its first visit,
+  // so all ~380 collage tiles (~1,400 images) used to sit in the DOM behind
+  // every later screen and re-render with it. Mount the first GROUPS_FIRST,
+  // always cover the tile focus returns to, and grow as the end nears.
+  const [winN, setWinN] = useState(GROUPS_FIRST);
+  const focusIdx = focusKey ? order.findIndex((g) => g.key === focusKey) : -1;
+  const limit = mode === 'platform' ? order.length
+    : Math.min(order.length, Math.max(winN, focusIdx + 1 + GROUPS_CHUNK));
+  const mountedKeys = useMemo(() => new Set(order.slice(0, limit).map((g) => g.key)), [order, limit]);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (limit >= order.length) return;
+    const el = sentinelRef.current;
+    const bump = () => setWinN((n) => Math.max(n, limit) + GROUPS_CHUNK);
+    if (!el || typeof IntersectionObserver === 'undefined') { bump(); return; }
+    let io: IntersectionObserver | null = null;
+    try {
+      io = new IntersectionObserver((es) => { if (es.some((e) => e.isIntersecting)) bump(); }, { rootMargin: '800px' });
+      io.observe(el);
+    } catch { bump(); }
+    return () => { try { io?.disconnect(); } catch { } };
+  }, [limit, order.length]);
   // Every tile registers its DOM node so the jump can (a) locate the currently
   // focused tile via .gpfocus containment and (b) force focus onto the target.
   const tileEls = useRef(new Map<string, any>());
@@ -1042,6 +1067,17 @@ export function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
     const target = _scrubTargetIdx(ord.map((o) => o.label), cur, dir);
     const g = ord[target];
     const el = tileEls.current.get(g.key);
+    if (!el && target !== cur) {
+      // Past the mounted window: mount up to it, then jump once it exists.
+      setWinN((n) => Math.max(n, target + 1 + GROUPS_CHUNK));
+      setTimeout(() => {
+        const e2 = tileEls.current.get(g.key);
+        if (!e2) return;
+        _forceGamepadFocus(e2);
+        try { e2.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch { /* ignore */ }
+      }, 60);
+      playSteamSound('deck_ui_tab_transition_01');
+    }
     if (el && target !== cur) {
       _forceGamepadFocus(el);
       try { el.scrollIntoView({ block: 'center', behavior: 'smooth' }); } catch { /* ignore */ }
@@ -1119,7 +1155,7 @@ export function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
     <div style={{ paddingTop: '16px' }}>
       {scrubOverlay}
       {sections.map((s) => {
-        const items = groups.filter((g) => s.kinds.includes(g.kind || 'collection'));
+        const items = groups.filter((g) => s.kinds.includes(g.kind || 'collection') && mountedKeys.has(g.key));
         if (items.length === 0) return null;
         return (
           <div key={s.title} style={{ marginBottom: '6px' }}>
@@ -1141,6 +1177,7 @@ export function GroupsPanel({ mode, visible, onOpenGroup, svcStatus }:
           </div>
         );
       })}
+      {limit < order.length && <div ref={sentinelRef} style={{ height: '1px' }} />}
     </div>
   );
 }
@@ -2258,20 +2295,20 @@ export function LibraryGamesPage() {
     const tick = async () => {
       const active = syncJob.ids.filter((id) => _dlActive.has(id));
       let frac = 0, speed = 0;
-      await Promise.all(active.map(async (id) => {
-        try {
-          const p = await getDownloadProgress(id);
-          if (p) {
-            if (typeof p.percent === 'number') frac += p.percent / 100;
-            if (typeof p.speed === 'number') speed += p.speed;
-          }
-        } catch { /* transient */ }
-      }));
-      if (alive) setSyncStats({ frac, speed });
+      // The shared progress snapshot (downloads.ts), not a poll of our own.
+      for (const id of active) {
+        const p = progressOf(id);
+        if (!p) continue;
+        const v = typeof p.exact === 'number' ? p.exact : p.percent;
+        if (typeof v === 'number') frac += v / 100;
+        if (typeof p.speed === 'number') speed += p.speed;
+      }
+      if (alive) setSyncStats((prev) => (prev.frac === frac && prev.speed === speed ? prev : { frac, speed }));
     };
     tick();
-    const id = setInterval(tick, 350);
-    return () => { alive = false; clearInterval(id); };
+    const off = onProgress(tick);
+    const release = watchProgress();
+    return () => { alive = false; off(); release(); };
   }, [syncJob]);
 
   // Unified progress: the one-shot "Sync missing" batch takes precedence (it's

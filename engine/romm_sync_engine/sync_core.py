@@ -15,6 +15,7 @@ from pathlib import Path
 
 from .paths import app_id, cache_dir, client_name, config_dir, library_dir
 from .save_channels import snapshots_supported
+from . import events as _events
 from . import (eden_config, emulator_saves, folder_saves, gamecube_saves,
                play_sessions, ps2_memcard, save_channels, switch_content, switch_nsz,
                title_ids)
@@ -269,6 +270,7 @@ def push_notification(kind, title, body, rom_id=None, has_cover=False,
             'action':     action,
             'timestamp':  time.time(),
         })
+    _events.publish('notifications')
     if activity_kind:
         _record_activity(activity_kind, title, body)
 
@@ -2955,10 +2957,13 @@ class ReachabilityLatch:
                 f"{self.OKS_TO_RECONNECT}) — waiting for a second success "
                 f"before calling it a reconnect")
             return False
+        dev_was = self.device_online
         self.online = True
         # The API answering proves the device has a link too — but only once we
         # believe the answer.
         self.device_online = True
+        if was is not True or dev_was is not True:
+            _events.publish('connection')
         if was is False:
             self._ok_streak = 0
             if self._on_reconnect:
@@ -2978,6 +2983,7 @@ class ReachabilityLatch:
         self._fail_streak += 1
         if self._fail_streak >= self.FAILS_TO_OFFLINE:
             self.online = False
+            _events.publish('connection')
             logging.info(
                 f"Reachability probe failed {self._fail_streak}x in a row — "
                 f"server unreachable, going offline{': ' + str(reason) if reason else ''}")
@@ -2996,10 +3002,14 @@ class ReachabilityLatch:
         if self.online is not False:
             self.online = False
             logging.info(f"Latching offline{': ' + str(reason) if reason else ''}")
+            _events.publish('connection')
 
     def set_device_online(self, online):
         """What the OS last said about the link (navigator online/offline)."""
+        was = self.device_online
         self.device_online = bool(online)
+        if was != self.device_online:
+            _events.publish('connection')
 
 
 # What this client tells RomM it can do, on registration and on connect.
@@ -12694,7 +12704,10 @@ class AutoSyncManager:
                     # on the next app start. Closing the emulator is the moment
                     # the save is both final and worth confirming to the user.
                     eden_running = emulator_saves.eden_is_running()
-                    self.game_running = bool(retroarch_running or eden_running)
+                    now_running = bool(retroarch_running or eden_running)
+                    if now_running != self.game_running:
+                        self.game_running = now_running
+                        _events.publish('game')
                     # Cemu is not part of game_running: nothing syncs on its
                     # close yet. It only ends a play session.
                     self._monitor_beat = time.time()
@@ -13665,6 +13678,7 @@ class AutoSyncManager:
                            'device': op.get('device_name')},
             }
         self.log(f"⚖️ {Path(local_path).name}: conflict parked for the user")
+        _events.publish('conflicts')
         if announce:
             # Found in the background: no popup mid-whatever, just word that
             # one is waiting. It's asked when the game is next launched.
@@ -13713,6 +13727,7 @@ class AutoSyncManager:
             state['answers'][cid] = (choice, time.time())
             state['prompt'].discard(cid)
             state['seen'].discard(cid)
+        _events.publish('conflicts')
         return True
 
     def _ask_conflict_dialog(self, op, local_path):
@@ -15513,6 +15528,7 @@ class AutoSyncManager:
                 # have landed.
                 self.session_epoch += 1
                 self._session_sync_lock.release()
+                _events.publish('session')
 
         threading.Thread(target=_run, daemon=True, name="romm-session-sync").start()
 
@@ -15768,9 +15784,12 @@ class AutoSyncManager:
         # meanwhile (the other side caught up) drops.
         state = self._conflicts()
         with state['lock']:
-            for cid in [c for c, v in state['pending'].items()
-                        if only_rom_id is None or v['rom_id'] == only_rom_id]:
+            dropped = [c for c, v in state['pending'].items()
+                       if only_rom_id is None or v['rom_id'] == only_rom_id]
+            for cid in dropped:
                 del state['pending'][cid]
+        if dropped:
+            _events.publish('conflicts')
         self._sync_trigger = trigger
         # On a server with save channels, the saves channels can carry go
         # that way, and negotiate keeps the rest. Their (rom_id, slot) keys

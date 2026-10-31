@@ -346,6 +346,7 @@ export function CancelDownloadButton({ onCancel }: { onCancel: () => void }) {
 export function DownloadStatusRow({ romId, name, onCancel }: { romId: number; name: string; onCancel?: () => void }) {
   const prog = useDownloadProgress(romId, true);
   const pct = Math.max(0, Math.min(100, prog?.percent ?? 0));
+  const fill = Math.max(0, Math.min(100, prog?.exact ?? prog?.percent ?? 0));
   const extracting = prog?.state === 'extracting';
   const bytes = prog && prog.total > 0 ? `${fmtBytes(prog.downloaded)} / ${fmtBytes(prog.total)}` : '';
   const eta = prog ? formatEta(prog.eta) : '';
@@ -372,7 +373,7 @@ export function DownloadStatusRow({ romId, name, onCancel }: { romId: number; na
         </span>
       </div>
       <div style={{ height: '4px', borderRadius: '2px', background: V2.surface, marginTop: '7px', overflow: 'hidden' }}>
-        <div style={{ height: '100%', width: `${pct}%`, background: barColor, borderRadius: '2px', transition: 'width 0.3s ease, background 0.3s ease' }} />
+        <div style={{ height: '100%', width: `${fill}%`, background: barColor, borderRadius: '2px', transition: 'width 0.3s ease, background 0.3s ease' }} />
       </div>
       {sub && <div style={{ fontSize: '10.5px', color: V2.fgMuted, marginTop: '5px', fontVariantNumeric: 'tabular-nums' }}>{sub}</div>}
       </div>

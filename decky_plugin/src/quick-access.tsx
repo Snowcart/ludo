@@ -27,8 +27,9 @@ import {
 import { FaSync, FaCog, FaGamepad } from "react-icons/fa";
 import { BsGearFill } from "react-icons/bs";
 import { notifyLibraryRefreshed } from "./app";
+import { getServiceStatusLite } from "./app/rpc";
+import { watchTopic } from "./app/push";
 
-const getServiceStatus = callable<[], any>("get_service_status");
 const getConfig = callable<[], any>("get_config");
 const refreshFromRomm = callable<[boolean], any>("refresh_from_romm");
 
@@ -47,7 +48,6 @@ export function QuickAccessPanel() {
   const [status, setStatus] = useState<any>({ status: 'loading', message: 'Loading…' });
   const [configured, setConfigured] = useState<boolean | null>(null);
   const configuredRef = useRef<boolean | null>(null);
-  const intervalRef = useRef<any>(null);
 
   const getStatusColor = () => {
     // Prefer the finer-grained connection state: a cached-offline session is a
@@ -87,16 +87,18 @@ export function QuickAccessPanel() {
       if (configuredRef.current === false) {
         if (!(await checkConfigured())) return;
       }
-      setStatus(await getServiceStatus());
+      setStatus(await getServiceStatusLite());
     } catch {
       setStatus({ status: 'error', message: '❌ Plugin error' });
     }
   };
 
+  // Everything shown here (the dot, "N games, M collections", configured or
+  // not) moves only with connection or library-load state, which the backend
+  // nudges as 'connection'. 2s is only the pace against a backend that can't.
   useEffect(() => {
     checkConfigured().then(refreshStatus);
-    intervalRef.current = setInterval(refreshStatus, 2000);
-    return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
+    return watchTopic('connection', refreshStatus, 2000, 30000);
   }, []);
 
   if (configured === null) {

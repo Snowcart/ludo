@@ -36,6 +36,7 @@ from .release_token import release_token
 # Claim our app identity before anything reads or writes engine state. Ludo
 # keeps ~/.config/ludo; it shares nothing with the GTK app.
 from romm_sync_engine import paths as _paths  # noqa: E402
+from romm_sync_engine import events as _events  # noqa: E402
 _paths.set_app_id("ludo")
 _paths.set_client_name("Ludo")
 # Downloads, covers and generated icons go under ~/Ludo rather than the GTK
@@ -656,6 +657,35 @@ class SaveConflictPending(Exception):
         self.conflict = conflict
 
 
+
+class _ProgressTable(dict):
+    """rom_id -> download progress entry, which nudges the UI on what matters.
+
+    Entries are replaced wholesale (never mutated in place) on every chunk. A
+    nudge goes out only when a download starts, changes phase or message
+    (downloading -> extracting, say), ends, or is dropped: the moments a user
+    sees. Progress within a phase is read by the UI's one shared poller.
+    """
+
+    def __setitem__(self, key, value):
+        old = self.get(key)
+        super().__setitem__(key, value)
+        if (not isinstance(old, dict) or not isinstance(value, dict)
+                or old.get('state') != value.get('state')
+                or old.get('message') != value.get('message')):
+            _events.publish('downloads')
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        _events.publish('downloads')
+
+    def pop(self, key, *default):
+        had = key in self
+        out = super().pop(key, *default)
+        if had:
+            _events.publish('downloads')
+        return out
+
 class LudoBackend:
     """Every RPC the UI can call, on either shell.
 
@@ -783,7 +813,20 @@ class LudoBackend:
     # look hung. Written from the fetch's worker threads and read by the status
     # poll; a dict rebind is atomic under the GIL, so no lock — never mutate it
     # in place.
-    _library_progress: dict = None
+    _library_progress_v: dict = None
+
+    # Both feed the connection/library banner and toasts; assigning them
+    # nudges the UI (see romm_sync_engine.events) instead of it polling.
+    @property
+    def _library_progress(self):
+        return self._library_progress_v
+
+    @_library_progress.setter
+    def _library_progress(self, v):
+        changed = v != self._library_progress_v
+        self._library_progress_v = v
+        if changed:
+            _events.publish('connection')
 
     # Set between pairing and the end of the setup wizard, to hold back the
     # whole-library walk until the user has picked their platforms. Pairing has
@@ -804,7 +847,18 @@ class LudoBackend:
     # {'kind': 'failed'}, else None. Only ever set for the FIRST library load on
     # this device; the frontend calls ack_library_announcement() once it has
     # shown it, which persists the fact so a plugin reload doesn't re-toast.
-    _announce_library: dict = None
+    _announce_library_v: dict = None
+
+    @property
+    def _announce_library(self):
+        return self._announce_library_v
+
+    @_announce_library.setter
+    def _announce_library(self, v):
+        changed = v != self._announce_library_v
+        self._announce_library_v = v
+        if changed:
+            _events.publish('connection')
 
     # Reachability state, distinct from RomMClient.authenticated (which is
     # sticky — a network drop never flips it). The state machine itself lives in
@@ -832,7 +886,7 @@ class LudoBackend:
     # Live per-game download progress {rom_id: {percent, downloaded, total, speed,
     # eta, state}} populated by download_game's progress_callback and polled by the
     # frontend via get_download_progress() for the cover/button fill UI.
-    _download_progress: dict = {}
+    _download_progress: dict = _ProgressTable()
 
     # rom_ids the user asked to stop. download_rom polls this between chunks and
     # deletes its partial file when it sees the id; cleared when a download starts.
@@ -2308,12 +2362,20 @@ class LudoBackend:
         Drives the offline sync-queue indicator ("N saves waiting to sync").
         Best-effort: 0 when auto-sync isn't up or anything goes wrong.
         """
+        # Walks every save and state folder on disk; the status poll asks every
+        # 1.5-2s, so reuse the answer for a few seconds.
+        now = time.monotonic()
+        cached = getattr(self, '_pending_saves_cache', None)
+        if cached and now - cached[0] < 5.0:
+            return cached[1]
+        n = 0
         try:
             if self._auto_sync and hasattr(self._auto_sync, 'count_pending_saves'):
-                return self._auto_sync.count_pending_saves()
+                n = self._auto_sync.count_pending_saves()
         except Exception as e:
             logging.debug(f"_count_pending_saves failed: {e}")
-        return 0
+        self._pending_saves_cache = (now, n)
+        return n
 
     def _save_activity(self):
         """What save-sync is doing right now — feeds the live sync indicator.
@@ -2345,8 +2407,33 @@ class LudoBackend:
             logging.debug(f"get_pending_uploads failed: {e}")
         return []
 
-    async def get_service_status(self):
-        """Build and return current sync status directly from live object state."""
+    async def get_service_status(self, lite=False, collections_rev=None):
+        """Build and return current sync status directly from live object state.
+
+        ``lite`` drops the per-collection list (hundreds of entries on a big
+        library, ~100 KB): callers that only need the connection state poll
+        every couple of seconds, including mid-game.
+
+        ``collections_rev`` is the ``collections_rev`` of the caller's last
+        reply. When the list hasn't changed since, it is left out and
+        ``collections_unchanged`` is set, so the steady-state poll is a few
+        hundred bytes instead of the whole list.
+        """
+        st = await self._service_status()
+        if not isinstance(st, dict):
+            return st
+        if lite:
+            return {k: v for k, v in st.items() if k not in ('collections', 'details')}
+        cols = st.get('collections')
+        if isinstance(cols, list):
+            rev = hashlib.sha1(json.dumps(cols, sort_keys=True, default=str).encode()).hexdigest()[:16]
+            st['collections_rev'] = rev
+            if collections_rev and collections_rev == rev:
+                st = {k: v for k, v in st.items() if k != 'collections'}
+                st['collections_unchanged'] = True
+        return st
+
+    async def _service_status(self):
         try:
             if not (self._retry_thread and self._retry_thread.is_alive()):
                 return {
@@ -2517,7 +2604,9 @@ class LudoBackend:
                 # holds the auto-sync lock, so this instance is browsing only.
                 'sync_blocked':            bool(status.get('sync_blocked')),
                 'message':                 message,
-                'details':                 status,
+                # Everything but the collection list, which is already sent
+                # once below; carrying it twice doubled every status poll.
+                'details':                 {k: v for k, v in status.items() if k != 'collections'},
                 'collections':             collections,
                 'collection_count':        collection_count,
                 'actively_syncing_count':  actively_syncing_count,
@@ -2534,6 +2623,11 @@ class LudoBackend:
                 'collections':      [],
                 'collection_count': 0,
             }
+
+    async def events_supported(self):
+        """True: this backend nudges the UI on change (romm_sync_engine.events),
+        so its timers can fall back to a slow safety poll."""
+        return True
 
     async def drain_notifications(self):
         """Return and clear queued notification events from the sync engine.
@@ -5691,6 +5785,10 @@ class LudoBackend:
                     device_id, rid, 'failed',
                     'Cancelled on the device' if prog.get('state') == 'cancelled'
                     else prog.get('message') or 'Download failed')
+            # The request came from RomM's web UI, so nobody here started it or
+            # is watching it: say how it ended. A cancel made on this device
+            # already raises its own toast.
+            self._toast_remote_install(rom_id, g, name, prog)
         except Exception as e:
             logging.error(f"[INSTALL] request {rid} failed: {e}", exc_info=True)
             try:
@@ -5701,6 +5799,22 @@ class LudoBackend:
             active.discard(rid)
             self._install_jobs.pop(rid, None)
             self._install_cancelled.discard(rid)
+
+    def _toast_remote_install(self, rom_id, g, name, prog):
+        if not SYNC_CORE_AVAILABLE:
+            return
+        state = prog.get('state')
+        has_cover = bool(g and (g.get('cover_path') or g.get('path_cover_small')))
+        try:
+            if state == 'done':
+                _push_notification('install', 'Installed from RomM', name,
+                                   rom_id=rom_id, has_cover=has_cover)
+            elif state == 'error':
+                _push_notification('install', 'Install from RomM failed',
+                                   f"{name} — {prog.get('message') or 'download failed'}",
+                                   rom_id=rom_id, has_cover=has_cover, critical=True)
+        except Exception as e:
+            logging.debug(f"remote install toast failed: {e}")
 
     def _on_romm_scan_done(self, stats):
         """A scan finished in RomM: tell the frontend to check the library now.
@@ -5812,6 +5926,34 @@ class LudoBackend:
                 pass
         return r
 
+    def _pairing_identifier(self, settings, name):
+        """The identifier to start QR pairing with.
+
+        On approval RomM reuses the device whose client_device_identifier
+        matches this one, binds the new sign-in to it, and otherwise creates a
+        fresh device. Installs pushed from RomM only reach the device the
+        sign-in is bound to, so re-pairing must name the device Ludo already
+        syncs as. That device's identifier is not always its id: one carried
+        over from an older client keeps that client's identifier, and sending
+        the id instead made RomM create a second device, leaving Ludo syncing
+        as one and signed in as the other (installs refused as not_bound).
+        """
+        device_id = settings.get('Device', 'device_id', '')
+        if not device_id:
+            return f"ludo-{hashlib.sha256(name.encode()).hexdigest()[:24]}"
+        client = self._romm_client
+        if client and client.authenticated:
+            try:
+                device = client.get_device(device_id)
+                ident = ((device or {}).get('client_device_identifier') or '').strip()
+                if ident:
+                    if ident != settings.get('Device', 'client_identifier', ''):
+                        settings.set('Device', 'client_identifier', ident)
+                    return ident
+            except Exception as e:
+                logging.debug(f"[DEVICE] identifier lookup failed: {e}")
+        return settings.get('Device', 'client_identifier', '') or device_id
+
     def _ensure_device_registered(self):
         """Ensure this device is registered with RomM and device_id is stored.
 
@@ -5828,6 +5970,12 @@ class LudoBackend:
                 device = self._romm_client.get_device(existing)
                 if device:
                     logging.info(f"[DEVICE] verified on server: {existing}")
+                    # Remember the identifier RomM matches this device by, so a
+                    # later QR pairing lands on this same device (see
+                    # _pairing_identifier).
+                    ident = (device.get('client_device_identifier') or '').strip()
+                    if ident and ident != self._settings.get('Device', 'client_identifier', ''):
+                        self._settings.set('Device', 'client_identifier', ident)
                     # Reconcile a rename made while offline. set_device_name
                     # pushes immediately when it can, but the wizard often runs
                     # before the first connect, so the server would otherwise
@@ -5947,12 +6095,8 @@ class LudoBackend:
             import socket as _socket
             name = (settings.get('Device', 'device_name', '')
                     or _socket.gethostname())
-            # Reuse the stored device_id when we have one so re-pairing updates
-            # the same RomM device rather than littering the user's device list.
-            ident = (settings.get('Device', 'device_id', '')
-                     or f"ludo-{hashlib.sha256(name.encode()).hexdigest()[:24]}")
-
             loop = asyncio.get_event_loop()
+            ident = await loop.run_in_executor(None, lambda: self._pairing_identifier(settings, name))
             info, reason = await loop.run_in_executor(
                 None,
                 lambda: RomMClient(url).device_auth_init(
@@ -6026,7 +6170,11 @@ class LudoBackend:
                 settings = self._require_settings()
                 # ...unless the user re-paired to receive installs, which only
                 # reach the device the sign-in is bound to.
-                if poller.paired_device_id and (
+                if poller.paired_device_id and poller.paired_device_id == settings.get('Device', 'device_id', ''):
+                    # RomM bound the new sign-in to the device we already sync
+                    # as: nothing to move, installs reach it from now on.
+                    self._install_not_bound = False
+                elif poller.paired_device_id and (
                         not settings.get('Device', 'device_id', '')
                         or getattr(self, '_install_not_bound', False)):
                     # Sync once more as the old device first, so every save on
@@ -10118,6 +10266,9 @@ class LudoBackend:
                         prog = info.get('progress')  # 0..1
                         self._download_progress[rom_id] = {
                             'percent': int(round((prog or 0) * 100)),
+                            # Unrounded, for fills that should move every
+                            # chunk rather than in 1% steps (100 MB on 10 GB).
+                            'exact': round((prog or 0) * 100, 2),
                             'downloaded': info.get('downloaded', 0),
                             'total': info.get('total', 0),
                             'speed': info.get('speed', 0),
@@ -10337,6 +10488,12 @@ class LudoBackend:
             return {'success': False, 'message': 'Not downloading'}
         self._download_cancels.add(rom_id)
         return {'success': True}
+
+    async def get_downloads(self):
+        """Every tracked download in one call: {rom_id: entry}, same entries as
+        get_download_progress. The UI's single shared progress poller reads
+        this while anything downloads, instead of one poll per view per game."""
+        return {str(k): v for k, v in list(self._download_progress.items())}
 
     async def get_download_progress(self, rom_id: int):
         """Live progress for an in-flight download (polled by the cover/button fill UI).

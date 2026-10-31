@@ -12,6 +12,19 @@ import { callable } from "@ludo/host";
 
 // Call backend methods
 export const getServiceStatus = callable<[], any>("get_service_status");
+export const eventsSupported = callable<[], boolean>("events_supported");
+export const gameRunning = callable<[], { running: boolean }>("game_running");
+// Full status, but the collection list only when it changed since `rev`
+// (see get_service_status). Older backends ignore the args and send it all.
+export const getServiceStatusSince = callable<[boolean, string | null], any>("get_service_status");
+// Connection state without the per-collection list. Falls back to the full call
+// against a backend that predates the flag.
+const _getServiceStatusLite = callable<[boolean], any>("get_service_status");
+let _liteOk = true;
+export async function getServiceStatusLite(): Promise<any> {
+  if (_liteOk) { try { return await _getServiceStatusLite(true); } catch { _liteOk = false; } }
+  return getServiceStatus();
+}
 export const timeColdFetch = callable<[], any>("time_cold_fetch");
 // LUDO_DEBUG=1 in the plugin's environment. Gates developer-only Settings rows.
 export const isDebugMode = callable<[], boolean>("is_debug_mode");
@@ -131,6 +144,7 @@ export const setSwitchAddonMode = callable<[string], any>("set_switch_addon_mode
 export const toggleCollectionSync = callable<[string, boolean], any>("toggle_collection_sync");
 export const deleteCollectionRoms = callable<[string, string], any>("delete_collection_roms");
 export const getDownloadProgress = callable<[number], any>("get_download_progress");
+export const getDownloads = callable<[], Record<string, any>>("get_downloads");
 export const cancelDownloadRpc = callable<[number], any>("cancel_download");
 export const deleteGame = callable<[number], any>("delete_game");
 export const launchGame = callable<[number, (string | null)?, (number | null)?, (boolean)?], any>("launch_game");

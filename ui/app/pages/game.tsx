@@ -2049,7 +2049,7 @@ export function GameDetailPage() {
           <Focusable noFocusRing flow-children="horizontal" {...NAV_ENTER_FIRST} style={{ display: 'flex', gap: '10px', flexWrap: 'wrap', alignItems: 'center' }}>
             {!isDownloaded ? (
               <GameActionButton variant="emphasized" focusRef={ctaRef} disabled={!!busy || downloading} onClick={doDownload}
-                progress={downloading ? (dlPct ?? 0) : undefined}
+                progress={downloading ? (dlProg?.exact ?? dlPct ?? 0) : undefined}
                 label={downloading
                   ? (extracting ? `${dlProg?.message || 'Extracting…'}${dlPct != null ? ` ${padPct(dlPct)}%` : ''}`
                      : `${dlProg?.message || 'Downloading…'}${dlPct != null ? ` ${padPct(smoothPct)}%` : ''}`)

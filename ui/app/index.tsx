@@ -31,7 +31,7 @@ import { GameDetailPage } from "./pages/game";
 import { LibraryRootPage, LibraryGamesPage } from "./pages/library";
 import { refreshStatusNow } from "./status";
 import { stopBackgroundMonitoring, startBackgroundMonitoring } from "./notifications";
-import { setPreDownloadHook } from "./downloads";
+import { setPreDownloadHook, watchBackgroundInstalls } from "./downloads";
 import { maybePromptSwitchFirmware } from "./firmware";
 import { watchSaveConflicts } from "./saveConflict";
 
@@ -53,6 +53,7 @@ setPreDownloadHook(maybePromptSwitchFirmware);
 // Start monitoring immediately when module loads
 console.log('[PLUGIN INIT] Module loaded, starting background monitoring');
 startBackgroundMonitoring();
+watchBackgroundInstalls();
 
 // Settings page component
 // ---------------------------------------------------------------------------

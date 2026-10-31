@@ -1,3 +1,4 @@
+import { watchTopic } from "./push";
 import { host, showModal, Focusable, GamepadButton, ModalRoot } from "@ludo/host";
 import { toaster } from "./toast";
 import { libNavigate } from "./nav";
@@ -293,15 +294,14 @@ function MissingCoreModal({ gap, onPlay, closeModal }:
 
 function watchForSessionEnd() {
   if (_sessionWatch) return;   // one watcher is enough; launches are serial
-  const POLL_MS = 5000;
   // ~4h. A session longer than this is possible, but a watcher that outlives
   // its usefulness should stop rather than poll for the rest of the session.
-  const MAX_TICKS = 2880;
-  let ticks = 0;
+  const MAX_MS = 4 * 60 * 60 * 1000;
+  const started = Date.now();
   let base: number | null = null;
-  const stop = () => { clearInterval(_sessionWatch); _sessionWatch = null; };
-  _sessionWatch = setInterval(async () => {
-    if (++ticks > MAX_TICKS) { stop(); return; }
+  const stop = () => { _sessionWatch?.(); _sessionWatch = null; };
+  const check = async () => {
+    if (Date.now() - started > MAX_MS) { stop(); return; }
     try {
       const e = (await getSyncEpoch())?.epoch;
       if (typeof e !== 'number') return;
@@ -311,7 +311,11 @@ function watchForSessionEnd() {
       invalidateStateThumbs();
       _broadcastLibRefresh();
     } catch { /* transient — keep watching */ }
-  }, POLL_MS);
+  };
+  // The backend nudges 'session' when a play session's sync lands; 5s is the
+  // pace against one that can't. Baseline right away, at launch.
+  _sessionWatch = watchTopic('session', check, 5000, 60000);
+  check();
 }
 
 export async function runLaunch(romId: number, gameName: string, disc: string | null,
