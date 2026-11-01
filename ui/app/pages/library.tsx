@@ -1483,7 +1483,7 @@ export function InstallsRepairBanner({ status }: { status: any }) {
 // the server, folders and device, so there is nothing else to walk through.
 // The backend names this device to RomM, so the new sign-in binds to it and
 // installs pushed from the web reach it; the banner goes once that's true.
-function PairAgainModal({ closeModal }: { closeModal?: () => void }) {
+export function PairAgainModal({ closeModal }: { closeModal?: () => void }) {
   const [url, setUrl] = useState('');
   useEffect(() => { getConfig().then((c: any) => setUrl(String(c?.url || ''))).catch(() => { }); }, []);
   const { qr, retry } = useQrPairing(url, !!url, () => {

@@ -30,6 +30,9 @@ import { notifyLibraryRefreshed } from "./app";
 import { getServiceStatusLite } from "./app/rpc";
 import { watchTopic } from "./app/push";
 import { openInLibrary } from "./app/nav";
+import { useActiveDownloads, useDownloadProgress, useQueuedDownloads, watchProgress } from "./app/downloads";
+import { PairAgainModal } from "./app/pages/library";
+import { showModal } from "@decky/ui";
 
 const getConfig = callable<[], any>("get_config");
 const refreshFromRomm = callable<[boolean], any>("refresh_from_romm");
@@ -99,7 +102,10 @@ export function QuickAccessPanel() {
   // nudges as 'connection'. 2s is only the pace against a backend that can't.
   useEffect(() => {
     checkConfigured().then(refreshStatus);
-    return watchTopic('connection', refreshStatus, 2000, 30000);
+    const a = watchTopic('connection', refreshStatus, 2000, 30000);
+    // Saves waiting change when a play session's sync lands.
+    const b = watchTopic('session', refreshStatus, 30000, 60000);
+    return () => { a(); b(); };
   }, []);
 
   if (configured === null) {
@@ -144,6 +150,8 @@ export function QuickAccessPanel() {
         </div>
       </PanelSectionRow>
 
+      <ActivityRows status={status} />
+
       <PanelSectionRow>
         <ButtonItem
           layout="below"
@@ -157,6 +165,68 @@ export function QuickAccessPanel() {
       </PanelSectionRow>
 
     </PanelSection>
+  );
+}
+
+// What Ludo is doing right now, at a glance: downloads, saves waiting, and
+// anything that needs the user. Each row only appears when it applies; the
+// download rows follow the shared progress store (pushed, not polled).
+const _rowStyle = { display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.85em', padding: '2px 0', color: '#d1d5db' } as const;
+
+function DownloadRow({ romId, name }: { romId: number; name: string }) {
+  const p = useDownloadProgress(romId, true);
+  const pct = p?.state === 'installing' ? 'Installing' : `${p?.percent ?? 0}%`;
+  return (
+    <PanelSectionRow>
+      <div style={{ ..._rowStyle, flexDirection: 'column', alignItems: 'stretch', gap: '4px' }}>
+        <div style={{ display: 'flex', gap: '8px' }}>
+          <span style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{name || 'Downloading'}</span>
+          <span style={{ fontVariantNumeric: 'tabular-nums', color: '#9ca3af' }}>{pct}</span>
+        </div>
+        <div style={{ height: '3px', borderRadius: '2px', background: 'rgba(255,255,255,0.12)', overflow: 'hidden' }}>
+          <div style={{ height: '100%', width: `${p?.exact ?? p?.percent ?? 0}%`, background: '#8b74e8', transition: 'width 0.25s linear' }} />
+        </div>
+      </div>
+    </PanelSectionRow>
+  );
+}
+
+function ActivityRows({ status }: { status: any }) {
+  useEffect(() => watchProgress(), []);
+  const active = useActiveDownloads();
+  const queued = useQueuedDownloads();
+  const pending = Number(status?.pending_saves) || 0;
+  const pair = () => {
+    Navigation.Navigate("/romm-sync-library"); Navigation.CloseSideMenus();
+    setTimeout(() => showModal(<PairAgainModal />), 400);
+  };
+  return (
+    <>
+      {active.slice(0, 3).map((d) => <DownloadRow key={d.romId} romId={d.romId} name={d.name} />)}
+      {(active.length > 3 || queued.length > 0) && (
+        <PanelSectionRow><div style={{ ..._rowStyle, color: '#9ca3af' }}>
+          {[active.length > 3 ? `${active.length - 3} more downloading` : '', queued.length ? `${queued.length} queued` : ''].filter(Boolean).join(' · ')}
+        </div></PanelSectionRow>
+      )}
+      {pending > 0 && (
+        <PanelSectionRow><div style={_rowStyle}>
+          {pending === 1 ? '1 game waiting to sync saves' : `${pending} games waiting to sync saves`}
+        </div></PanelSectionRow>
+      )}
+      {status?.sync_blocked && (
+        <PanelSectionRow><div style={{ ..._rowStyle, color: '#fbbf24' }}>
+          Save sync is running in another Ludo
+        </div></PanelSectionRow>
+      )}
+      {status?.install_not_bound && status?.connection === 'online' && (
+        <PanelSectionRow>
+          <ButtonItem layout="below" onClick={pair}
+            description="Pair once more to receive installs sent from RomM.">
+            Pair again
+          </ButtonItem>
+        </PanelSectionRow>
+      )}
+    </>
   );
 }
 
