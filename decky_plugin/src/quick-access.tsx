@@ -29,6 +29,7 @@ import { BsGearFill } from "react-icons/bs";
 import { notifyLibraryRefreshed } from "./app";
 import { getServiceStatusLite } from "./app/rpc";
 import { watchTopic } from "./app/push";
+import { openInLibrary } from "./app/nav";
 
 const getConfig = callable<[], any>("get_config");
 const refreshFromRomm = callable<[boolean], any>("refresh_from_romm");
@@ -89,7 +90,7 @@ export function QuickAccessPanel() {
       }
       setStatus(await getServiceStatusLite());
     } catch {
-      setStatus({ status: 'error', message: '❌ Plugin error' });
+      setStatus({ status: 'error', message: 'Ludo is not responding' });
     }
   };
 
@@ -139,7 +140,7 @@ export function QuickAccessPanel() {
       <PanelSectionRow>
         <div style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '0.85em', padding: '4px 0' }}>
           <div style={{ width: '8px', height: '8px', borderRadius: '50%', backgroundColor: getStatusColor(), flexShrink: 0 }} />
-          <span>{(status.message || '').replace(', ', ' - ')}</span>
+          <span>{status.message || ''}</span>
         </div>
       </PanelSectionRow>
 
@@ -155,23 +156,6 @@ export function QuickAccessPanel() {
         </ButtonItem>
       </PanelSectionRow>
 
-      <PanelSectionRow>
-        <ButtonItem
-          layout="below"
-          onClick={() => { Navigation.Navigate("/romm-sync-settings"); Navigation.CloseSideMenus(); }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <FaCog size={14} />
-            <span>Settings</span>
-          </div>
-        </ButtonItem>
-      </PanelSectionRow>
-
-      <PanelSectionRow>
-        <div style={{ fontSize: '11px', color: '#9ca3af', padding: '4px 2px 0', lineHeight: 1.4 }}>
-          Tip: press Select in the browser to open Settings.
-        </div>
-      </PanelSectionRow>
     </PanelSection>
   );
 }
@@ -199,11 +183,13 @@ export function QuickAccessTitle() {
         console.log('[REFRESH] Skipped — a library fetch is already running');
       } else {
         console.warn('[REFRESH] Refresh returned non-success:', result?.message);
+        toaster.toast({ title: 'Refresh failed', body: result?.message || 'Could not reach RomM.' });
       }
       // Keep spinning for at least 500ms for visual feedback
       setTimeout(() => setIsRefreshing(false), 500);
     } catch (error) {
       console.error('[REFRESH] Failed to refresh from RomM:', error);
+      toaster.toast({ title: 'Refresh failed', body: 'Could not reach RomM.' });
       setIsRefreshing(false);
     }
   };
@@ -223,10 +209,7 @@ export function QuickAccessTitle() {
       </DialogButton>
       <DialogButton
         style={{ height: '28px', width: '28px', minWidth: 0, padding: 0, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-        onClick={() => {
-          Navigation.Navigate("/romm-sync-settings");
-          Navigation.CloseSideMenus();
-        }}
+        onClick={() => { openInLibrary('settings'); Navigation.CloseSideMenus(); }}
       >
         <BsGearFill style={{ display: 'block' }} />
       </DialogButton>

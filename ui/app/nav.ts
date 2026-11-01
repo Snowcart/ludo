@@ -136,6 +136,17 @@ export function RouteGuard({ children }: { children: any }) {
 export function setLibViewHooks(push: ((v: LibView) => void) | null, pop: (() => void) | null) {
   _libPushView = push;
   _libPopView = pop;
+  if (push && _pendingView) { const v = _pendingView; _pendingView = null; push(v); }
+}
+
+// Open an in-library view from outside Ludo (the Quick Access panel): through
+// the library, so B from it lands on Ludo's Home like it does in-app, rather
+// than on a lone page whose Back leaves the plugin.
+let _pendingView: LibView | null = null;
+export function openInLibrary(v: LibView) {
+  if (_libPushView) { _libPushView(v); return; }
+  _pendingView = v;
+  try { Navigation.Navigate('/romm-sync-library'); } catch { _pendingView = null; }
 }
 
 /** Push an in-library view; false if no library route is hosting us. */
