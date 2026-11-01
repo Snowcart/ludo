@@ -24,12 +24,13 @@ import {
   callable,
   toaster,
 } from "@ludo/host";
-import { FaSync, FaCog, FaGamepad } from "react-icons/fa";
+import { FaSync, FaCog } from "react-icons/fa";
 import { BsGearFill } from "react-icons/bs";
 import { notifyLibraryRefreshed } from "./app";
 import { getServiceStatusLite } from "./app/rpc";
 import { watchTopic } from "./app/push";
 import { openInLibrary } from "./app/nav";
+import { ROMM_ICON } from "./romm-icon";
 import { useActiveDownloads, useDownloadProgress, useQueuedDownloads, watchProgress } from "./app/downloads";
 import { PairAgainModal } from "./app/pages/library";
 import { showModal } from "@decky/ui";
@@ -158,7 +159,7 @@ export function QuickAccessPanel() {
           onClick={() => { Navigation.Navigate("/romm-sync-library"); Navigation.CloseSideMenus(); }}
         >
           <div style={{ display: 'flex', alignItems: 'center', gap: '6px' }}>
-            <FaGamepad size={14} />
+            <img src={ROMM_ICON} style={{ width: '16px', height: '16px', display: 'block' }} />
             <span>Open Ludo</span>
           </div>
         </ButtonItem>
