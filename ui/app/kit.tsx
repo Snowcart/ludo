@@ -1272,10 +1272,13 @@ export function ScrollFade({ maxHeight, refresh, children, style }: {
 // `message` is a line of explanation under the title, for a picker that is
 // really a question. `onDismiss` runs when it is closed without a choice (B,
 // Escape, the scrim) -- a caller waiting on the answer needs to hear "none".
-export function PickerModal({ title, message, items, onDismiss, closeModal }: {
+export function PickerModal({ title, message, children, items, onDismiss, closeModal }: {
   title: string;
   message?: string;
-  items: { key: string | number; label: string; active?: boolean; danger?: boolean; onSelect: () => void }[];
+  // Shown between the message and the rows (e.g. a QR code).
+  children?: any;
+  // keepOpen: the row acts inside the modal (e.g. retry) instead of closing it.
+  items: { key: string | number; label: string; active?: boolean; danger?: boolean; keepOpen?: boolean; onSelect: () => void }[];
   onDismiss?: () => void;
   closeModal?: () => void;
 }) {
@@ -1320,12 +1323,13 @@ export function PickerModal({ title, message, items, onDismiss, closeModal }: {
           {message && (
             <div style={{ fontSize: '13px', color: V2.fg2, lineHeight: 1.4, padding: '0 8px 10px' }}>{message}</div>
           )}
+          {children}
           <div style={{ height: '1px', background: V2.border, margin: '0 4px 4px' }} />
           {items.map((it) => (
             <UserMenuRow key={it.key}
               icon={it.active ? <FaCheck size={14} style={{ color: V2.brand }} /> : null}
               label={it.label} danger={it.danger}
-              onSelect={() => { closeModal?.(); it.onSelect(); }} />
+              onSelect={() => { if (!it.keepOpen) closeModal?.(); it.onSelect(); }} />
           ))}
         </Focusable>
       </Focusable>

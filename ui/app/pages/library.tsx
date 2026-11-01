@@ -4,7 +4,8 @@ import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } fr
 import { deleteCollectionRoms, getConfig, getMostPlayed, getRecapDue, dismissRecap, playTimeSyncIfDue, getHomeData, getLibraryGames, getLibraryGroups, getResumeStateEnabled, getServiceStatus, repairEmulatorPaths, searchGames, toggleCollectionSync, checkLibraryStale, refreshFromRomm} from "../rpc";
 import { CardRow, CollectionTile, GameTile, PlatformTile, _resumeStatesPref, _setResumeStatesPref, _stateThumbListeners, _stateThumbs, loadStateThumbs, tileElFor} from "../tiles";
 import { _autoFocusFirstRef, _forceGamepadFocus, _gpFocusEl, playSteamSound, returnFocusRomId, setReturnFocusTarget, useAutoFocus } from "../shell";
-import { Bumper, GameActionButton, V2SearchField, useEtaFromPct, Shimmer} from "../kit";
+import { Bumper, GameActionButton, PickerModal, V2SearchField, useEtaFromPct, Shimmer} from "../kit";
+import { QrCode, useQrPairing } from "../pairing";
 import { V2, fmtPlayTime, formatEta, formatSpeed } from "../theme";
 import { Focusable, GamepadButton, Navigation, host, showModal } from "@ludo/host";
 import { toaster } from "../toast";
@@ -1440,7 +1441,7 @@ export function SyncBlockedBanner({ status }: { status: any }) {
 export function InstallsRepairBanner({ status }: { status: any }) {
   const [focused, setFocused] = useState(false);
   if (!status?.install_not_bound || status?.connection !== 'online') return null;
-  const onPair = () => libNavigate("/romm-sync-config");
+  const onPair = () => showModal(<PairAgainModal />);
   return (
     <div style={{
       display: 'flex', alignItems: 'center', gap: '10px',
@@ -1475,6 +1476,55 @@ export function InstallsRepairBanner({ status }: { status: any }) {
         Pair again
       </Focusable>
     </div>
+  );
+}
+
+// The QR from the setup wizard, in a modal over the library: re-pairing keeps
+// the server, folders and device, so there is nothing else to walk through.
+// The backend names this device to RomM, so the new sign-in binds to it and
+// installs pushed from the web reach it; the banner goes once that's true.
+function PairAgainModal({ closeModal }: { closeModal?: () => void }) {
+  const [url, setUrl] = useState('');
+  useEffect(() => { getConfig().then((c: any) => setUrl(String(c?.url || ''))).catch(() => { }); }, []);
+  const { qr, retry } = useQrPairing(url, !!url, () => {
+    toaster.toast({ title: 'Paired', body: 'Installs from RomM now reach this device.' });
+    closeModal?.();
+  });
+  const failed = qr.status === 'error';
+  return (
+    <PickerModal title="Pair again" closeModal={closeModal}
+      message="Scan with your phone and approve. This device keeps its saves and history."
+      items={[
+        ...(failed && !qr.unavailable ? [{ key: 'retry', label: 'Get a new code', keepOpen: true, onSelect: retry }] : []),
+        { key: 'close', label: 'Cancel', onSelect: () => { } },
+      ]}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: '16px', padding: '4px 8px 14px', minHeight: '148px' }}>
+        <div style={{
+          width: '148px', height: '148px', flexShrink: 0, borderRadius: V2.radiusMd, overflow: 'hidden',
+          display: 'flex', alignItems: 'center', justifyContent: 'center',
+          background: qr.matrix ? 'transparent' : V2.surface, lineHeight: 0,
+          opacity: qr.status === 'approved' ? 0.35 : 1, transition: 'opacity 0.3s ease',
+        }}>
+          {qr.matrix ? <QrCode matrix={qr.matrix} size={148} /> : null}
+        </div>
+        <div style={{ minWidth: 0, display: 'flex', flexDirection: 'column', gap: '6px' }}>
+          {qr.userCode && (
+            <div style={{ fontFamily: 'monospace', fontSize: '20px', fontWeight: 700, letterSpacing: '0.18em', color: V2.fg }}>
+              {qr.userCode}
+            </div>
+          )}
+          {!qr.matrix && qr.verifyUrl && (
+            <div style={{ fontSize: '12px', color: V2.fg2, wordBreak: 'break-all' }}>{qr.verifyUrl}</div>
+          )}
+          <div style={{ fontSize: '13px', color: failed ? V2.danger : V2.fgMuted }}>
+            {failed ? qr.message
+              : qr.status === 'approved' ? 'Approved — finishing up…'
+              : qr.status === 'waiting' ? 'Waiting for approval…'
+              : 'Getting a code…'}
+          </div>
+        </div>
+      </div>
+    </PickerModal>
   );
 }
 
