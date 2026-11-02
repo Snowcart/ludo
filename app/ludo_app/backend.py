@@ -74,7 +74,7 @@ try:
         platform_folder_candidates,
         flatpak_app_installed,
         STANDALONE_EMULATORS, find_standalone_builds,
-        _extract_archive, _archive_member_names, WIIU_SLUGS, resolve_wiiu_rom,
+        _extract_archive, _archive_member_names, arcade_romset_stays_zipped, WIIU_SLUGS, resolve_wiiu_rom,
         get_desktop_tile_status, add_desktop_tile, remove_desktop_tile,
         drain_notifications as _drain_notifications,
         push_notification as _push_notification,
@@ -4768,6 +4768,9 @@ class LudoBackend:
                     return unpacked
             if not dest.is_file() or dest.suffix.lower() not in ('.zip', '.7z'):
                 return dest
+            slug = (self._games_index().get(rom_id) or {}).get('platform_slug')
+            if arcade_romset_stays_zipped(slug, _archive_member_names(dest)):
+                return dest
             if not self._archive_needs_extract(dest):
                 return dest
             # Surface an "Extracting… N%" state so the UI doesn't sit at a silent
@@ -9426,6 +9429,7 @@ class LudoBackend:
             path = Path(path)
             if not sync:
                 return
+            sync.forget_title_ids()
 
             # A folder ROM. RomM folds a base game and its patch into ONE entry
             # whose download is a directory, so the add-ons arrive inside it and

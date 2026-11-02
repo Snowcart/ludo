@@ -836,6 +836,31 @@ def close_eden(timeout=10.0):
     return not eden_pids()
 
 
+def eden_restore_dir(title_id, extra_data_dir=None):
+    """Where a save for ``title_id`` belongs on this device, or None if unknown.
+
+    A title that has a save uses that directory. One that has never booted can
+    still be placed when this Eden has exactly one real user: the folder is
+    then a fact, not a guess. No profile or several means Eden has to boot it
+    first, because a save under the wrong user is invisible to the player.
+    """
+    for save in find_eden_saves(extra_data_dir):
+        if save['title_id'].lower() == title_id.lower():
+            return save['path']
+    users, first = set(), None
+    for data_dir in eden_data_dirs(extra_data_dir):
+        root = data_dir.joinpath(*_EDEN_SAVE_ROOT, '0' * 16)
+        try:
+            found = [d for d in root.iterdir() if d.is_dir() and d.name.strip('0')]
+        except OSError:
+            continue
+        users.update(d.name.lower() for d in found)
+        first = first or (found[0] if found else None)
+    if len(users) == 1:
+        return first / title_id.upper()
+    return None
+
+
 def unpack_save(zip_path, title_id, extra_data_dir=None, backup_dir=None):
     """Restore a packed save into Eden's tree for `title_id`.
 
@@ -864,20 +889,14 @@ def unpack_save(zip_path, title_id, extra_data_dir=None, backup_dir=None):
     if eden_is_running():
         raise RuntimeError("Eden is running; close it before restoring a save")
 
-    existing = None
-    for save in find_eden_saves(extra_data_dir):
-        if save['title_id'].lower() == title_id.lower():
-            existing = save['path']
-            break
+    existing = eden_restore_dir(title_id, extra_data_dir)
     if existing is None:
-        # No directory for this title means the game has never booted here.
-        # Creating one would mean guessing a user ID, and a save under the
-        # wrong profile is invisible to the player -- refuse instead.
         raise FileNotFoundError(
             f"no Eden save directory for {title_id}; boot the game once first")
+    existing.mkdir(parents=True, exist_ok=True)
 
     backup = None
-    if backup_dir is not None:
+    if backup_dir is not None and _newest_mtime(existing) is not None:
         backup_dir = Path(backup_dir)
         backup_dir.mkdir(parents=True, exist_ok=True)
         backup = backup_dir / f"{title_id}-{int(time.time())}.zip"

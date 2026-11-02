@@ -1849,6 +1849,7 @@ class SettingsManager:
             self._stamp()
             # Migrate settings from older versions
             self._migrate_settings()
+            self._secure_stored_credentials()
         else:
             # Create default settings
             self.config['RomM'] = {
@@ -1904,6 +1905,28 @@ class SettingsManager:
             }
 
             self.save_settings()
+
+    def _secure_stored_credentials(self):
+        """Close the file to other users and encrypt anything left in the clear.
+
+        Builds whose cryptography failed to load stored credentials as plain
+        text. Without a cipher they stay that way, but still owner-only.
+        """
+        try:
+            os.chmod(self.config_file, 0o600)
+        except OSError as e:
+            logging.warning(f"could not restrict {self.config_file}: {e}")
+        if not self.cipher or 'RomM' not in self.config:
+            return
+        changed = False
+        with SettingsManager._lock:
+            for key in ('username', 'password', 'client_token'):
+                value = self.config['RomM'].get(key, '')
+                if value and not value.startswith('gAAAAA'):
+                    self.config['RomM'][key] = self._encrypt(value)
+                    changed = True
+            if changed:
+                self.save_settings()
 
     def _migrate_settings(self):
         """Migrate settings from older app versions - add missing sections/keys"""
@@ -1980,7 +2003,11 @@ class SettingsManager:
         """
         with SettingsManager._lock:
             tmp = self.config_file.with_suffix('.ini.tmp')
-            with open(tmp, 'w') as f:
+            # Created owner-only: it holds credentials, and replace() below
+            # makes this file's mode the mode of settings.ini.
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, 'w') as f:
                 self.config.write(f)
                 f.flush()
                 os.fsync(f.fileno())
@@ -2493,6 +2520,25 @@ def _extract_archive(archive_path, dest_dir, on_progress=None):
     except Exception as e:
         logging.warning(f"Failed to extract {archive_path}: {e}")
     return False
+
+
+# Arcade cores identify a game by its zip's short name and read the romset from
+# inside the archive, so unpacking one makes it "romset unknown".
+ARCADE_SLUGS = ('arcade', 'mame', 'hbmame', 'fbneo', 'fba', 'fbalpha',
+                'neogeo', 'neogeoaes', 'neogeomvs', 'neo-geo-aes', 'neo-geo-mvs',
+                'cps1', 'cps2', 'cps3')
+
+
+def arcade_romset_stays_zipped(platform_slug, member_names):
+    """True for an archive on an arcade platform that IS a romset.
+
+    A RomM folder game arrives as an outer archive holding romsets (mslug.zip
+    and neogeo.zip) or a CHD. That wrapper still has to be opened.
+    """
+    if str(platform_slug or '').lower() not in ARCADE_SLUGS:
+        return False
+    return not any(Path(m).suffix.lower() in ('.zip', '.7z', '.chd')
+                   for m in member_names)
 
 
 # A Wii U download is always unpacked, as in argosy-launcher (its wiiu entry in
@@ -5430,7 +5476,9 @@ class RomMClient:
                     # Only extract if it looks like a directory-based game
                     has_subdirs = any('/' in f and not f.endswith('/') for f in file_list)
                     has_pc_game_files = any(f.lower().endswith(('.exe', '.bat', '.cfg', '.ini', '.dll')) for f in file_list)
-                    should_extract = has_subdirs and has_pc_game_files
+                    should_extract = (has_subdirs and has_pc_game_files
+                                      and not arcade_romset_stays_zipped(
+                                          rom_details.get('platform_slug'), file_list))
 
                     if should_extract:
                         extract_dir = download_path.parent / download_path.stem
@@ -14768,6 +14816,10 @@ class AutoSyncManager:
         re-packs to the same bytes and the same content hash, and the negotiate
         engine correctly sees nothing to do.
 
+        A title in _eden_awaiting_restore is left out: its only save here is
+        what first boot wrote, and uploading that would replace the player's
+        progress on the server.
+
         Restore is the other direction and deliberately does NOT share this
         path: see _restore_standalone_save, which backs the existing save up
         before replacing it and refuses while Eden is running. Packing here
@@ -14814,8 +14866,12 @@ class AutoSyncManager:
             return entries
 
         pack_dir = cache_dir() / 'packed_saves'
+        awaiting = self._eden_awaiting_restore()
         for save in saves:
             title_id = save['title_id']
+            if title_id in awaiting and self._eden_restore_still_owed(
+                    title_id, awaiting[title_id]):
+                continue
             rom_id = self._rom_id_for_title_id(title_id)
             if not rom_id:
                 # No local ROM carries this title ID. Without Sigil the ID is
@@ -14894,6 +14950,7 @@ class AutoSyncManager:
             if written:
                 emulator_saves.write_keys_marker(
                     entry.get('file_name'), entry.get('md5_hash'))
+                self.forget_title_ids()
                 self.log(f"🔑 Installed {entry.get('file_name')}")
             return {'installed': written, 'status': 'installed'}
         except Exception as e:
@@ -15079,6 +15136,7 @@ class AutoSyncManager:
                     'message': self._NO_KEYS_MESSAGE}
 
         if result['keys']:
+            self.forget_title_ids()
             self.log(f"🔑 Installed {result['keys']} key file(s)")
 
         if not result['installed']:
@@ -16156,6 +16214,50 @@ class AutoSyncManager:
                 _record_activity('error', 'Save conflict' if summary.get('conflicts') and not summary.get('errors') else 'Save sync issues', ', '.join(parts))
         return summary
 
+    # Titles whose server save could not be restored because the game had never
+    # booted here. RomM cannot protect these: with no sync history it compares
+    # timestamps, so the save written on first boot looks newer and would upload
+    # over the player's progress. Kept on disk so a restart does not forget.
+    def _eden_awaiting_restore(self):
+        try:
+            data = json.loads((cache_dir() / 'eden_awaiting_restore.json').read_text())
+            return data if isinstance(data, dict) else {}
+        except (OSError, ValueError):
+            return {}
+
+    def _set_eden_awaiting_restore(self, title_id, op=None):
+        awaiting = self._eden_awaiting_restore()
+        title_id = title_id.upper()
+        if op is None:
+            if title_id not in awaiting:
+                return
+            del awaiting[title_id]
+        else:
+            awaiting[title_id] = {'rom_id': op.get('rom_id'), 'save_id': op.get('save_id')}
+        path = cache_dir() / 'eden_awaiting_restore.json'
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix('.tmp')
+        tmp.write_text(json.dumps(awaiting))
+        os.replace(tmp, path)
+
+    def _eden_restore_still_owed(self, title_id, entry):
+        """False once the server no longer has a save to restore for this title.
+
+        Otherwise deleting that save in RomM would stop this game syncing for
+        good. Any doubt, such as being offline, keeps holding the upload back.
+        """
+        try:
+            url = urljoin(self.romm_client.base_url, f"/api/roms/{entry.get('rom_id')}")
+            r = self.romm_client.session.get(url, timeout=15)
+            if r.status_code == 200 and not (r.json().get('user_saves') or []):
+                self._set_eden_awaiting_restore(title_id)
+                return False
+        except Exception as e:
+            logging.debug(f"could not check the awaited save for {title_id}: {e}")
+        logging.info(f"Eden save {title_id}: not uploading a first-boot save "
+                     f"over the server's; restoring the server's first")
+        return True
+
     def _restore_standalone_save(self, op, device_id, session_id):
         """Download a standalone emulator's save and unpack it into its tree.
 
@@ -16210,11 +16312,23 @@ class AutoSyncManager:
                      f"restore once it is closed.")
             return False
 
+        try:
+            override = (self.settings.get('Emulators', 'eden_data_dir', '') or '').strip()
+        except Exception:
+            override = ''
+        if title_id and emulator_saves.eden_restore_dir(title_id, override or None) is None:
+            self._set_eden_awaiting_restore(title_id, op)
+            self.log(f"ℹ️ Save-sync: {title_id} hasn't booted here yet; its server "
+                     f"save will restore after the first boot.")
+            return False
+
+        # No device_id: downloading with one makes RomM record this device as
+        # synced to the save, which is only true after the unpack below works.
         staged = cache_dir() / 'incoming_saves' / file_name
         staged.parent.mkdir(parents=True, exist_ok=True)
         if not self.romm_client.download_save_by_id(
                 op.get('save_id'), 'saves', staged,
-                device_id=device_id, session_id=session_id):
+                device_id=None, session_id=session_id):
             return False
 
         # A save this client once mislabelled ('switch' instead of 'eden') was
@@ -16237,11 +16351,7 @@ class AutoSyncManager:
             staged.unlink(missing_ok=True)
             return False
 
-        try:
-            override = (self.settings.get('Emulators', 'eden_data_dir', '') or '').strip()
-        except Exception:
-            override = ''
-
+        pack_hash = RomMClient.compute_content_hash(staged)
         try:
             result = emulator_saves.unpack_save(
                 staged, title_id, extra_data_dir=override or None,
@@ -16254,6 +16364,7 @@ class AutoSyncManager:
                      f"and will restore next sync.")
             return False
         except FileNotFoundError as e:
+            self._set_eden_awaiting_restore(title_id, op)
             self.log(f"ℹ️ Save-sync: {e}")
             return False
         except Exception as e:
@@ -16262,8 +16373,13 @@ class AutoSyncManager:
         finally:
             staged.unlink(missing_ok=True)
 
-        self.log(f"✅ Restored {result['files']} save file(s) for {title_id} "
-                 f"(previous save backed up to {result['backup'].name})")
+        self._set_eden_awaiting_restore(title_id)
+        if device_id:
+            self.romm_client.confirm_save_downloaded(
+                op.get('save_id'), 'saves', device_id, content_hash=pack_hash)
+        backed_up = (f" (previous save backed up to {result['backup'].name})"
+                     if result['backup'] else '')
+        self.log(f"✅ Restored {result['files']} save file(s) for {title_id}{backed_up}")
         return True
 
     @staticmethod
@@ -16928,6 +17044,10 @@ class AutoSyncManager:
             return text[:4]
         return text
 
+    def forget_title_ids(self):
+        """Rebuild the title-ID index on next use."""
+        self._title_id_index = None
+
     def _rom_id_for_title_id(self, title_id):
         """rom_id owning a game-native title ID, or None.
 
@@ -16937,8 +17057,8 @@ class AutoSyncManager:
         Going through the ROM rather than querying RomM for a serial is
         deliberate: RomM's ROM payload carries no title ID, and the disc does.
 
-        Built once per session. A ROM downloaded afterwards is picked up on the
-        next start, which is the same latency the rest of the library has.
+        Built once per session, and dropped after a Switch download or a keys
+        install (forget_title_ids), which can each make a game identifiable.
         """
         if self._title_id_index is None:
             self._title_id_index = {}
