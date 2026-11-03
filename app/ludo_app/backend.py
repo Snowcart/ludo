@@ -2159,6 +2159,8 @@ class LudoBackend:
             # is a decision rather than a screen in progress.)
             if self._defer_library_fetch:
                 logging.info("Setup in progress — holding save auto-sync until setup ends")
+            elif os.environ.get('LUDO_DEV_READ_ONLY'):
+                logging.info("Read-only sandbox — save auto-sync stays off")
             # Always on: Ludo has no switch for it. AutoSync/auto_enable_on_connect
             # is RomM RetroArch Sync's, and a settings file carried over from it
             # with that off left sync silently dead, with nothing in Ludo to undo it.
@@ -11041,9 +11043,11 @@ class LudoBackend:
             # that just came down from the server, and reconcile has to have
             # filed it under the launching core first.
             entry_slot = self._resume_entry_slot(g, core) if resume else None
-            ok, msg = self._retroarch.launch_game(Path(launch_path), platform_name,
-                                                  entry_slot=entry_slot,
-                                                  platform_slug=self._platform_slug_for(g))
+            # Off the event loop: it waits to see whether the emulator survives.
+            ok, msg = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: self._retroarch.launch_game(
+                    Path(launch_path), platform_name, entry_slot=entry_slot,
+                    platform_slug=self._platform_slug_for(g)))
             # Remember an explicit disc choice so the next plain Play resumes it.
             if ok and disc:
                 try:

@@ -3092,6 +3092,17 @@ class RomMClient:
         self.auth_rejected = False
         self._refreshing = False
         self.session.hooks['response'].append(self._watch_auth)
+        # try-dev.sh: a sandbox shares the real account and device, so it may
+        # look but must never change anything on the server.
+        if os.environ.get('LUDO_DEV_READ_ONLY'):
+            _send = self.session.request
+            def _read_only(method, url, *args, **kwargs):
+                if str(method).upper() not in ('GET', 'HEAD', 'OPTIONS'):
+                    logging.info(f"[READ-ONLY] blocked {method} {url}")
+                    raise requests.exceptions.ConnectionError(
+                        f"LUDO_DEV_READ_ONLY blocked {method} {url}")
+                return _send(method, url, *args, **kwargs)
+            self.session.request = _read_only
         # What /api/heartbeat says the server can do; see get_server_features.
         self.server_features = {}
         # The device a QR pairing's token is bound to (RomM creates one per
@@ -7171,7 +7182,10 @@ class RetroArchInterface:
             'Nintendo - Nintendo DS': ['desmume', 'melonds', 'melondsds'],
             'nds': ['desmume', 'melonds', 'melondsds'], 
             'Sega Saturn': ['beetle_saturn', 'kronos'],
-            'Arcade': ['mame', 'fbneo', 'fbalpha'],
+            # FBNeo first: it finds neogeo.zip in the system directory, where
+            # BIOS files are put. MAME only looks beside the ROM, so every Neo
+            # Geo game exits with "Required files are missing" under it.
+            'Arcade': ['fbneo', 'mame', 'fbalpha'],
             'PlayStation 2': ['pcsx2', 'play'],
             'Nintendo GameCube': ['dolphin'],
             'Sega Dreamcast': ['flycast', 'redream'],
@@ -8644,6 +8658,10 @@ class RetroArchInterface:
             for label, core in entries:
                 if label == alt and core in available_cores:
                     return core
+        # ES-DE lists MAME first for arcade, but Ludo puts neogeo.zip in the BIOS
+        # folder, which MAME never searches. See platform_core_map's 'Arcade'.
+        if slug == 'arcade' and 'fbneo' in available_cores:
+            return 'fbneo'
         for _, core in entries:  # ES-DE priority order; first available wins
             if core in available_cores:
                 return core
@@ -9574,10 +9592,18 @@ class RetroArchInterface:
             self._focus_window_after_launch(
                 result, match=(standalone['key'] if standalone else 'retroarch'))
 
-            # Wait a moment to see if it fails immediately
+            # Wait a moment to see if it fails immediately. A flatpak has to
+            # start its sandbox before the core even runs, and RetroDECK fails
+            # after 2s, which used to count as a successful launch.
             import time
-            time.sleep(2)
+            deadline = time.monotonic() + (8 if cmd[0] == 'flatpak' else 2)
+            while time.monotonic() < deadline and result.poll() is None:
+                time.sleep(0.1)
 
+            if result.poll() is not None and result.returncode == 0:
+                # The player can't have quit that fast on purpose, but nothing
+                # says it failed either.
+                return True, f"{rom_path.name} closed"
             if result.poll() is not None:
                 # Process has already exited
                 stdout, stderr = result.communicate()
@@ -9594,8 +9620,11 @@ class RetroArchInterface:
                     error_msg += "2. Missing library dependencies\n"
                     error_msg += "3. Permission issues\n"
                     error_msg += f"Try running manually: {' '.join(cmd)}"
-                print(error_msg)
-                return False, error_msg
+                logging.warning(error_msg)
+                return False, (f"The emulator closed straight away (exit code "
+                               f"{result.returncode}). Files or BIOS it needs may "
+                               f"be missing, or this core can't run {rom_path.name}. "
+                               f"Try another core.")
 
             # Reap the child once it exits. Two reasons, both real:
             #
@@ -10256,7 +10285,7 @@ class RetroArchInterface:
             'genesis': 'genesis_plus_gx',
             'n64': 'mupen64plus_next',
             'saturn': 'beetle_saturn',
-            'arcade': 'mame',
+            'arcade': 'fbneo',
             'mame': 'mame',
             'fbneo': 'fbneo',
             'atari2600': 'stella',

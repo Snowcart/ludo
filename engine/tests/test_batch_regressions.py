@@ -85,6 +85,17 @@ def arcade():
     check('consoles are unaffected', f('psx', ['a.bin', 'a.cue']), False)
     check('Neo Geo CD is a disc system', f('neo-geo-cd', ['a.bin', 'a.cue']), False)
 
+    ra = object.__new__(C.RetroArchInterface)
+    ra._retrodeck_core_map = lambda: {
+        'arcade': [('MAME', 'mame'), ('FBNeo', 'fbneo')], 'cps2': [('MAME', 'mame')]}
+    ra._retrodeck_alt_emulator = lambda slug: None
+    pick = ra._retrodeck_core_for_slug
+    check('arcade prefers FBNeo over the ES-DE default', pick('arcade', ['mame', 'fbneo']), 'fbneo')
+    check('arcade falls back to MAME', pick('arcade', ['mame']), 'mame')
+    check('other systems keep ES-DE order', pick('cps2', ['mame', 'fbneo']), 'mame')
+    ra._retrodeck_alt_emulator = lambda slug: 'MAME'
+    check("a user's RetroDECK choice wins", pick('arcade', ['mame', 'fbneo']), 'mame')
+
 
 class FakeClient:
     base_url = 'http://romm'
