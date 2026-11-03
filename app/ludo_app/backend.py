@@ -5757,7 +5757,9 @@ class LudoBackend:
             logging.info(f"[INSTALL] RomM asked for {name} (request {rid})")
             if rid in self._install_cancelled:
                 return  # cancelled before it started; RomM has already ended it
-            _record_activity('download', 'Install requested from RomM', name, rom_id=rom_id)
+            # Its own kind: the Downloads page lists every 'download' entry under
+            # "Recently completed", so this one showed there while still running.
+            _record_activity('install', 'Install requested from RomM', name, rom_id=rom_id)
             started = asyncio.run(self.download_game(rom_id))
             if not started.get('success'):
                 client.report_install(device_id, rid, 'failed',

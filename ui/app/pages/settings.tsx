@@ -106,7 +106,7 @@ function _startBenchPoll(before: string | null) {
 // persisted backend activity log (get_recent_activity), so it covers background
 // work that happened while no UI was open.
 const ACTIVITY_ICONS: Record<string, any> = {
-  download: FaDownload, sync: FaSync, save: FaSave, delete: FaTrash,
+  download: FaDownload, install: FaDownload, sync: FaSync, save: FaSave, delete: FaTrash,
   account: FaUser, error: FaExclamationTriangle,
 };
 
