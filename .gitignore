@@ -124,3 +124,6 @@ app/ludo_app/_token.py
 # Core dumps
 core
 core.[0-9]*
+
+# zip temp files left by interrupted plugin builds
+zi??????
