@@ -2762,6 +2762,55 @@ def _safe_page_limit(limit):
 # Anything _group_sibling_roms reads must be in here — it needs id, sibling_roms,
 # files, fs_extension, rom_user, name and fs_name — as must anything a caller
 # reads off the returned rows.
+# RomM's region names by its priority shortcodes (handler/filesystem/base_handler.py),
+# and the filename tags it ranks after full releases (models/base.py).
+_REGION_SHORTCODES = {
+    'au': ('Australia',), 'asi': ('Asia',), 'br': ('Brazil',), 'ca': ('Canada',),
+    'cn': ('China',), 'uk': ('England',), 'eu': ('Europe',), 'fi': ('Finland',),
+    'fr': ('France',), 'de': ('Germany',), 'gr': ('Greece',), 'nl': ('Holland', 'Netherlands'),
+    'hk': ('Hong Kong',), 'it': ('Italy',), 'jp': ('Japan',), 'kr': ('Korea',),
+    'no': ('Norway',), 'ru': ('Russia',), 'sp': ('Spain',), 'se': ('Sweden',),
+    'tw': ('Taiwan',), 'us': ('USA',), 'wor': ('World',), 'ame': ('Americas',),
+    'bg': ('Bulgaria',), 'cl': ('Chile',), 'cz': ('Czech Republic',), 'dk': ('Denmark',),
+    'hu': ('Hungary',), 'il': ('Israel',), 'kw': ('Kuwait',), 'mor': ('Middle East',),
+    'nz': ('New Zealand',), 'oce': ('Oceania',), 'pe': ('Peru',), 'pl': ('Poland',),
+    'pt': ('Portugal',), 'sk': ('Slovakia',), 'tr': ('Turkey',),
+}
+_PRERELEASE_TAGS = ('demo', 'beta', 'proto', 'sample', 'kiosk', 'preview')
+
+
+def region_ranks_for_priority(codes):
+    """{lowercase region name: rank} for RomM's SCAN_REGION_PRIORITY. Unknown
+    codes such as "ss" add nothing and don't shift the ranks after them."""
+    ranks = {}
+    rank = 0
+    for code in dict.fromkeys(str(c).lower() for c in codes or []):
+        names = _REGION_SHORTCODES.get(code)
+        if names:
+            ranks.update({n.lower(): rank for n in names})
+            rank += 1
+    return ranks
+
+
+def region_names_for_priority(codes):
+    """One display name per known code in RomM's SCAN_REGION_PRIORITY."""
+    return [_REGION_SHORTCODES[c][0]
+            for c in dict.fromkeys(str(c).lower() for c in codes or [])
+            if c in _REGION_SHORTCODES]
+
+
+ALL_REGION_NAMES = sorted(n for names in _REGION_SHORTCODES.values() for n in names[:1])
+
+
+def filename_region_rank(file_name, ranks):
+    """Best rank among a filename's region tags: "Game (USA, Europe).nds"."""
+    best = len(ranks) + 1
+    for tag in re.findall(r'\(([^)]*)\)', file_name or ''):
+        for name in tag.split(','):
+            best = min(best, ranks.get(name.strip().lower(), best))
+    return best
+
+
 ROM_TRIM_FIELDS = (
     'id', 'name', 'fs_name', 'fs_name_no_ext', 'fs_extension', 'fs_size_bytes',
     'platform_id', 'platform_slug', 'files',
@@ -2786,6 +2835,9 @@ ROM_TRIM_FIELDS = (
     # this device has never downloaded — see _rom_id_for_title_id. Absent on
     # older servers, where the trim simply drops them.
     'title_id', 'save_target',
+    # False when RomM has an entry but no file behind it, so a download can only
+    # fail. Absent on older servers, which means "has a file".
+    'has_file_on_disk',
 )
 
 
@@ -3920,7 +3972,7 @@ class RomMClient:
                     'with_rom_id_index': 'false',
                     'with_char_index': 'false',
                     'with_filter_values': 'false',   # only `items` is read; see _fetch_pages_parallel
-                    'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages'
+                    'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages,has_file_on_disk'
                 },
                 timeout=30
             )
@@ -4094,7 +4146,7 @@ class RomMClient:
                 'with_rom_id_index': 'false',
                 'with_char_index': 'false',
                 'with_filter_values': 'false',   # only `items` is read; see _fetch_pages_parallel
-                'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages'
+                'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages,has_file_on_disk'
             })
             response = self.session.get(
                 urljoin(self.base_url, '/api/roms'),
@@ -4154,6 +4206,42 @@ class RomMClient:
         except Exception as e:
             print(f"Error fetching virtual collection ROMs: {e}")
         return []
+
+    # This device's own region order, when it has one. Set by the app: every
+    # client it creates, for whatever reason, has to honour the same setting.
+    region_order_source = None
+
+    def server_regions(self):
+        """Region names in the server's priority order; [] when unavailable."""
+        if getattr(self, '_server_regions', None) is None:
+            source, RomMClient.region_order_source = RomMClient.region_order_source, None
+            try:
+                self.region_ranks()
+            finally:
+                RomMClient.region_order_source = source
+        return getattr(self, '_server_regions', None) or []
+
+    def region_ranks(self):
+        """The server's region priority as ranks; fetched once per client.
+        {} when unavailable, which leaves groups in their existing order."""
+        source = RomMClient.region_order_source
+        order = source() if source else None
+        if order:
+            return {str(n).lower(): i for i, n in enumerate(order)}
+        cached = getattr(self, '_region_ranks', None)
+        if cached is not None:
+            return cached
+        try:
+            r = self.session.get(urljoin(self.base_url, '/api/config'), timeout=10)
+            if r.status_code != 200:
+                return {}
+            codes = r.json().get('SCAN_REGION_PRIORITY')
+            self._server_regions = region_names_for_priority(codes)
+            self._region_ranks = region_ranks_for_priority(codes)
+            return self._region_ranks
+        except Exception as e:
+            print(f"Could not read region priority: {e}")
+            return {}
 
     def _group_sibling_roms(self, items):
         """Group sibling ROMs (regional variants) under a main ROM
@@ -4262,12 +4350,37 @@ class RomMClient:
                     return (kind, -len(rom.get('files') or []), -size)
                 candidates = sorted(candidates, key=_switch_key)
 
+            # A version RomM has no file for can't be the tile while another
+            # version can be downloaded, not even one marked as main: the whole
+            # game would read as unavailable. Stable, so the order above holds
+            # within each side.
+            def _no_file(rom):
+                return rom.get('has_file_on_disk') is False
+            candidates = sorted(candidates, key=_no_file)
+
+            # Nothing chosen by the user or the group's shape: rank like RomM's
+            # own gallery, so both show the same version. Switch keeps its
+            # base/update/DLC order above.
+            if not (any(_switch_content_row(r) for r in candidates)
+                    or any(not r.get('fs_extension')
+                           or (r.get('rom_user') or {}).get('is_main_sibling')
+                           for r in candidates if not _no_file(r))):
+                ranks = self.region_ranks() if self else {}
+                def _release_key(rom):
+                    name = (rom.get('fs_name') or '').lower()
+                    regions = rom.get('regions') or []
+                    region = str(regions[0]).lower() if regions else ''
+                    return (_no_file(rom),
+                            any(f'({t}' in name for t in _PRERELEASE_TAGS),
+                            ranks.get(region, len(ranks) + 1))
+                candidates = sorted(candidates, key=_release_key)
+
             for rom in candidates:
                 fs_extension = rom.get('fs_extension', '')
                 is_main = rom.get('rom_user', {}).get('is_main_sibling', False)
 
                 # Folder ROMs have no extension or empty extension
-                if not fs_extension or is_main:
+                if (not fs_extension or is_main) and not _no_file(rom):
                     if main_rom is None:
                         main_rom = rom
                     else:
@@ -4292,7 +4405,8 @@ class RomMClient:
             # itself is the single downloadable unit. Groups with no folder ROM
             # (e.g. separate per-region .nsp/.chd ROMs) keep all their siblings.
             has_folder = any(
-                not (r.get('fs_extension') or '') for r in group_roms
+                not (r.get('fs_extension') or '') and not _no_file(r)
+                for r in group_roms
             )
             if has_folder:
                 drop_ids = {
@@ -4887,7 +5001,7 @@ class RomMClient:
                             # so dropping the opt-outs changes nothing there.
                             'with_char_index': 'false',
                             'with_filter_values': 'false',
-                            'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages'
+                            'fields': 'id,name,fs_name,fs_extension,platform_name,platform_slug,files,multi,path_cover_large,path_cover_small,sibling_roms,rom_user,regions,languages,has_file_on_disk'
                         },
                         timeout=timeout
                     )
@@ -5301,6 +5415,8 @@ class RomMClient:
             
             if response.status_code != 200:
                 print(f"ROM download failed with status {response.status_code}")
+                if response.status_code == 404:
+                    return False, "File not found on RomM."
                 return False, f"API download failed: HTTP {response.status_code}"
             
             # Check if we're getting HTML (error page) instead of a ROM file

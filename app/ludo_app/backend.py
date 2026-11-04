@@ -67,7 +67,7 @@ except ImportError as e:
 try:
     from romm_sync_engine.sync_core import (
         SettingsManager, RomMClient, RetroArchInterface, DEVICE_CAPABILITIES,
-        AutoSyncManager, CollectionSyncManager,
+        AutoSyncManager, CollectionSyncManager, filename_region_rank, ALL_REGION_NAMES,
         BiosTrackingManager, ROM_TRIM_FIELDS, LIBRARY_PAGE_SIZE,
         SteamShortcutManager, CoverArtManager,
         build_sync_status, is_path_validly_downloaded, detect_retrodeck,
@@ -150,7 +150,7 @@ snapshot_file = CONFIG_DIR / 'library_snapshot.json'
 # its count forever, so nothing would ever heal it. Hence a bump rather than a
 # migration: the grouping cannot be redone from the persisted rows, because the
 # siblings it would need were folded away when the snapshot was written.
-SNAPSHOT_SCHEMA = 3
+SNAPSHOT_SCHEMA = 4  # 4: rows and versions carry has_file_on_disk
 
 # How long the last library fetch took, so a user can report it without having
 # to reproduce it while someone watches. Diagnosing the RomM fetch has meant
@@ -216,7 +216,7 @@ resume_file = CONFIG_DIR / 'library_resume.ndjson'
 # checkpoint replayed under v3 keying would serve the first platform's rows to
 # every platform. Neither the total nor the page_size check would catch it —
 # both are unchanged by the switch.
-RESUME_SCHEMA = 3
+RESUME_SCHEMA = 4
 # Same 24h bound Argosy puts on its sync-resume generation: past that, the
 # library has probably moved on and replaying stale pages is worse than refetching.
 RESUME_TTL_SECONDS = 24 * 3600
@@ -236,6 +236,15 @@ def _platform_label(rom):
     """
     return (rom.get('platform_custom_name') or rom.get('platform_display_name')
             or rom.get('platform_name') or 'Unknown')
+
+
+NO_SERVER_FILE_MESSAGE = 'RomM has no file for this entry.'
+
+
+def _no_server_file(rom):
+    """True when RomM says this row has no file. Older servers omit the field,
+    which must read as having one."""
+    return (rom or {}).get('has_file_on_disk') is False
 
 
 def _variant_count(game):
@@ -942,6 +951,7 @@ class LudoBackend:
         # base rom_id -> {'file_name', 'percent', 'state'} for the add-on
         # fetch_switch_add_on is downloading for that game.
         self._switch_fetch_state = {}
+        RomMClient.region_order_source = self._saved_region_order
         logging.info(f"Ludo backend {self._host.version} on host "
                      f"{self._host.name!r} (updates from {self._host.asset_suffix})")
 
@@ -1526,7 +1536,8 @@ class LudoBackend:
     # matching disc/member filenames, and falls back destructively when it finds
     # nothing), so they must stay present and complete for every game.
     _SNAPSHOT_FILE_KEYS = ('file_name', 'fs_name', 'file_size_bytes', 'size_bytes')
-    _SNAPSHOT_SIBLING_KEYS = ('id', 'name', 'fs_name', 'fs_name_no_ext', 'fs_extension')
+    _SNAPSHOT_SIBLING_KEYS = ('id', 'name', 'fs_name', 'fs_name_no_ext', 'fs_extension',
+                              'has_file_on_disk')
 
     @staticmethod
     def _project(entries, keys):
@@ -1739,6 +1750,17 @@ class LudoBackend:
                 # dropping them here would mark the game not-downloaded and
                 # offer to fetch a region the user already has.
                 variants = self._variant_downloads(g)
+                # The tile's version can change between fetches (a new region
+                # priority, a version gaining or losing its file). A file already
+                # on disk under another version must still count.
+                for s in (g.get('_sibling_files') or []):
+                    sid, fs = (s.get('id'), s.get('fs_name')) if isinstance(s, dict) else (None, None)
+                    if sid and fs and sid not in variants:
+                        p, on_disk = _resolve_download_path(download_dir, platform_slug, fs)
+                        if on_disk:
+                            variants[sid] = {'file_name': fs, 'local_path': str(p),
+                                             'name': s.get('name')}
+                            g['_variant_downloads'] = variants
                 if variants:
                     live = {str(vid): v for vid, v in variants.items()
                             if v.get('local_path')
@@ -3445,6 +3467,38 @@ class LudoBackend:
             return {'success': True, 'enabled': bool(enabled)}
         except Exception as e:
             logging.error(f"set_virtual_collections_visible error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    def _saved_region_order(self):
+        """This device's region order; [] means follow RomM's."""
+        try:
+            raw = self._settings.get('Library', 'region_order', '') or ''
+        except Exception:
+            return []
+        return [n for n in raw.split(',') if n in ALL_REGION_NAMES]
+
+    async def get_region_order(self):
+        """Settings ▸ Region order. `order` is always complete: the saved order,
+        or RomM's, with every other region after it."""
+        try:
+            client = self._romm_client
+            server = client.server_regions() if client else []
+            saved = self._saved_region_order()
+            start = saved or server
+            return {'success': True, 'follow': not saved, 'server': server,
+                    'order': start + [n for n in ALL_REGION_NAMES if n not in start]}
+        except Exception as e:
+            logging.error(f"get_region_order error: {e}", exc_info=True)
+            return {'success': False, 'message': str(e)}
+
+    async def set_region_order(self, order=None):
+        """Save this device's region order; empty goes back to following RomM."""
+        try:
+            names = [n for n in (order or []) if n in ALL_REGION_NAMES]
+            self._settings.set('Library', 'region_order', ','.join(names))
+            return {'success': True, 'follow': not names}
+        except Exception as e:
+            logging.error(f"set_region_order error: {e}", exc_info=True)
             return {'success': False, 'message': str(e)}
 
     async def get_screenshot_mode(self):
@@ -7229,6 +7283,9 @@ class LudoBackend:
             v = [x for x in (rom.get(k) or []) if x]
             if v:
                 flags[k] = v
+        # Only kept when true, like the flags above.
+        if _no_server_file(rom):
+            flags['no_server_file'] = True
         return {
             **flags,
             'name':            Path(file_name).stem if file_name else rom.get('name', 'Unknown'),
@@ -7257,6 +7314,9 @@ class LudoBackend:
             # Ids only — the pieces grouping dropped from sibling_roms (folder
             # members / per-region ROMs). Kept so raw server rows can be folded
             # back onto this entry; see _variant_parent_index.
+            '_no_file_variant_ids': [s.get('id') for s
+                                     in (rom.get('_region_save_siblings') or [])
+                                     if _no_server_file(s)],
             '_region_variant_ids': [s.get('id') for s
                                     in (rom.get('_region_save_siblings') or [])
                                     if s.get('id')],
@@ -7686,15 +7746,48 @@ class LudoBackend:
             parent['is_downloaded'] = True
             parent['local_path'] = entry['local_path']
 
+    def _playable_parent(self, idx: dict, rom: dict):
+        """The library entry to show instead of a version RomM has no file for.
+
+        None for a row with a file, or when its game has nothing better.
+        """
+        if not _no_server_file(rom):
+            return None
+        parent = idx.get(self._variant_parent_index().get(rom.get('id')))
+        return parent if parent and not parent.get('no_server_file') else None
+
+    def _collection_tile_count(self, col: dict, count):
+        """The number of tiles a collection opens to.
+
+        RomM counts rows, but no-file versions fold onto their game's entry when
+        the collection opens (see _playable_parent). Without ids, keep RomM's.
+        """
+        ids = col.get('rom_ids') or col.get('roms') or []
+        if not ids or not all(isinstance(i, int) for i in ids):
+            return count
+        idx = self._games_index()
+        parents = self._variant_parent_index()
+        tiles = set()
+        for rid in ids:
+            parent = idx.get(parents.get(rid)) if rid not in idx else None
+            no_file = parent and (rid in (parent.get('_no_file_variant_ids') or []) or any(
+                s.get('id') == rid and _no_server_file(s)
+                for s in (parent.get('_sibling_files') or []) if isinstance(s, dict)))
+            tiles.add(parents[rid] if no_file and not parent.get('no_server_file') else rid)
+        return len(tiles)
+
     def _variant_game(self, idx: dict, rom_id: int, variant_id: int):
         """A launchable game dict for a regional/disc variant of `rom_id`, or
         None. The variant has no library entry by design (see
         _record_variant_download), so build one from the parent plus the file
         the parent recorded — parent metadata, variant path.
+
+        `rom_id` may itself be a variant: a collection or Continue playing opens
+        the game by the variant's own id, which has no index entry.
         """
-        if not variant_id or variant_id == rom_id:
+        if not variant_id:
             return None
-        parent = idx.get(rom_id) or {}
+        parent = idx.get(rom_id) or idx.get(self._variant_parent_index().get(rom_id)) or {}
         v = self._variant_downloads(parent).get(variant_id) or {}
         path = v.get('local_path')
         if not path or not is_path_validly_downloaded(Path(path)):
@@ -7809,6 +7902,11 @@ class LudoBackend:
                               'is_m3u': False, 'is_region': False}]
                             if base else [])
                 if len(games) > 1:
+                    # First is what a plain Play boots and what the picker
+                    # defaults to, so the server's preferred region goes first.
+                    ranks = getattr(self._romm_client, 'region_ranks', dict)()
+                    if isinstance(ranks, dict) and ranks:
+                        games = sorted(games, key=lambda f: filename_region_rank(f.name, ranks))
                     return [{'name': f.name, 'path': str(f),
                              'is_m3u': False, 'is_region': True} for f in games]
                 if len(games) == 1:
@@ -7976,13 +8074,18 @@ class LudoBackend:
             idx = self._games_index()
             g = idx.get(rom_id)
             if not g:
-                return {'success': True, 'downloaded_ids': []}
+                return {'success': True, 'downloaded_ids': [], 'no_file_ids': []}
             try:
                 last = int(self._settings.get('LastVersion', str(rom_id), '') or 0)
             except Exception:
                 last = 0
             sibling_roms = g.get('sibling_roms', [])
             ids = [rom_id] + [s.get('id') for s in sibling_roms if s.get('id')]
+            no_file = [r.get('id') for key in ('_sibling_files', '_region_save_siblings')
+                       for r in (g.get(key) or [])
+                       if isinstance(r, dict) and _no_server_file(r)]
+            if g.get('no_server_file'):
+                no_file.append(rom_id)
             downloaded = [rid for rid in ids if idx.get(rid, {}).get('is_downloaded')]
             # Variants have no entry in the index (they're folded into this
             # game), so the region picker learns which ones are already on disk
@@ -7991,6 +8094,7 @@ class LudoBackend:
                 if vid not in downloaded and v.get('local_path'):
                     downloaded.append(vid)
             return {'success': True, 'downloaded_ids': downloaded,
+                    'no_file_ids': [i for i in no_file if i not in downloaded],
                     'last': last if last in downloaded else 0}
         except Exception as e:
             logging.error(f"get_local_siblings error: {e}", exc_info=True)
@@ -8059,6 +8163,7 @@ class LudoBackend:
                     count = col.get('rom_count')
                     if count is None:
                         count = len(col.get('roms') or col.get('rom_ids') or [])
+                    count = self._collection_tile_count(col, count)
                     # Kind drives the badge (favorite/smart/virtual) and section,
                     # mirroring RomM's collection index.
                     if col.get('is_favorite'):
@@ -8092,6 +8197,7 @@ class LudoBackend:
                         count = col.get('rom_count')
                         if count is None:
                             count = len(col.get('rom_ids') or [])
+                        count = self._collection_tile_count(col, count)
                         covers = (col.get('path_covers_small')
                                   or col.get('path_covers_large') or [])[:4]
                         vgroups.append({'key': vid, 'label': name,
@@ -8147,6 +8253,9 @@ class LudoBackend:
         # across a library this size.
         if g.get('is_orphan'):
             s['is_orphan'] = True
+        # A local copy stays playable whatever the server has.
+        if g.get('no_server_file') and not dl:
+            s['no_server_file'] = True
         # Region/language flag chips. Capped at 3 each — the tile only ever
         # draws three (RomM's Card Flags.vue does the same), so shipping more
         # would only fatten the localStorage cache.
@@ -8160,7 +8269,8 @@ class LudoBackend:
         if g.get('sibling_roms'):
             s['sibling_roms'] = [
                 {'rom_id': sib.get('id'), 'name': sib.get('name') or sib.get('fs_name_no_ext') or 'Variant',
-                 'fs_name_no_ext': sib.get('fs_name_no_ext')}
+                 'fs_name_no_ext': sib.get('fs_name_no_ext'),
+                 'fs_extension': sib.get('fs_extension')}
                 for sib in g['sibling_roms']
             ]
             # Only for games with versions: the picker tells same-titled rows
@@ -8200,6 +8310,14 @@ class LudoBackend:
                     if shot and self._is_nintendo_row(r):
                         continue
                     rid = r.get('id')
+                    # A collection can hold a version RomM has no file for. Show
+                    # the game's playable entry, so one that is available or
+                    # already downloaded doesn't read as "No file".
+                    playable = self._playable_parent(idx, r)
+                    if playable:
+                        if not any(x.get('rom_id') == playable['rom_id'] for x in games):
+                            games.append(self._serialize_game(playable))
+                        continue
                     local = idx.get(rid)
                     is_downloaded = bool(local and local.get('is_downloaded'))
                     if not local:
@@ -8221,6 +8339,8 @@ class LudoBackend:
                         'has_cover': bool(r.get('path_cover_small') or (local or {}).get('cover_path')),
                         'platform_slug': (local or {}).get('platform_slug') or r.get('platform_slug'),
                     }
+                    if _no_server_file(r) and not is_downloaded:
+                        entry['no_server_file'] = True
                     # Flag chips come off the raw row here, falling back to the
                     # cached entry for a game the library walk already saw.
                     for fk in ('regions', 'languages'):
@@ -8235,12 +8355,14 @@ class LudoBackend:
                     if sibs:
                         entry['sibling_roms'] = [
                             {'rom_id': s.get('id'), 'name': s.get('name') or 'Variant',
-                             'fs_name_no_ext': s.get('fs_name_no_ext')}
+                             'fs_name_no_ext': s.get('fs_name_no_ext'),
+                             'fs_extension': s.get('fs_extension')}
                             for s in sibs
                         ]
                         entry['file_name'] = r.get('fs_name') or (local or {}).get('file_name')
                         entry['region_count'] = len(sibs) + 1
-                    games.append(entry)
+                    if not any(x.get('rom_id') == rid for x in games):
+                        games.append(entry)
                     if rid and rid not in idx and r.get('path_cover_small'):
                         self._cover_paths[rid] = r.get('path_cover_small')
                 games.sort(key=lambda x: (x.get('name') or '').lower())
@@ -8345,6 +8467,8 @@ class LudoBackend:
                         'has_cover': bool(r.get('path_cover_small') or (local or {}).get('cover_path')),
                         'platform_slug': (local or {}).get('platform_slug') or r.get('platform_slug'),
                     }
+                    if _no_server_file(r) and not (local and local.get('is_downloaded')):
+                        entry['no_server_file'] = True
                     # Flag chips come off the raw row here, falling back to the
                     # cached entry for a game the library walk already saw.
                     for fk in ('regions', 'languages'):
@@ -8359,7 +8483,8 @@ class LudoBackend:
                     if sibs:
                         entry['sibling_roms'] = [
                             {'rom_id': s.get('id'), 'name': s.get('name') or 'Variant',
-                             'fs_name_no_ext': s.get('fs_name_no_ext')}
+                             'fs_name_no_ext': s.get('fs_name_no_ext'),
+                             'fs_extension': s.get('fs_extension')}
                             for s in sibs
                         ]
                         entry['file_name'] = r.get('fs_name') or (local or {}).get('file_name')
@@ -9161,7 +9286,8 @@ class LudoBackend:
                         out.append(str(x))
                 return [x for x in out if x]
 
-            local = self._games_index().get(rom_id) or {}
+            idx = self._games_index()
+            local = idx.get(rom_id) or self._variant_game(idx, rom_id, rom_id) or {}
 
             # Names present on this device, so each file row can say whether it
             # is actually here — RomM's Files table marks per-file state too.
@@ -9358,6 +9484,7 @@ class LudoBackend:
                 'ra_id': ra_id,
                 'fs_size_bytes': d.get('fs_size_bytes') or 0,
                 'is_downloaded': bool(local.get('is_downloaded')),
+                'no_server_file': _no_server_file(d) and not local.get('is_downloaded'),
                 'has_cover': bool(d.get('path_cover_small') or local.get('cover_path')),
             }
         except Exception as e:
@@ -10284,10 +10411,14 @@ class LudoBackend:
                 # 'name' is the filename stem (save-sync matching keys on it);
                 # the activity feed wants the metadata title.
                 display_name = g.get('display_name') or name
+                if g.get('no_server_file'):
+                    return {'success': False, 'message': NO_SERVER_FILE_MESSAGE}
             else:
                 r = self._romm_client.session.get(
                     urljoin(self._romm_client.base_url, f'/api/roms/{rom_id}'), timeout=15)
                 d = r.json() if r.status_code == 200 else {}
+                if _no_server_file(d):
+                    return {'success': False, 'message': NO_SERVER_FILE_MESSAGE}
                 platform_slug = d.get('platform_slug', 'Unknown')
                 file_name = d.get('fs_name') or f"{d.get('name', 'rom')}.rom"
                 name = d.get('name')
@@ -10724,7 +10855,7 @@ class LudoBackend:
                     'with_rom_id_index': 'false',
                     'with_char_index': 'false',
                     'with_filter_values': 'false',
-                    'fields': 'id,name,fs_name,platform_name,platform_slug,path_cover_small,merged_screenshots,rom_user',
+                    'fields': 'id,name,fs_name,platform_name,platform_slug,path_cover_small,merged_screenshots,rom_user,has_file_on_disk',
                 },
                 timeout=30,
             )
@@ -10751,7 +10882,8 @@ class LudoBackend:
             if self._platform_sync_off(rom, disabled):
                 continue
             rid = rom.get('id')
-            local = idx.get(rid)
+            local = (self._playable_parent(idx, rom) or idx.get(rid)
+                     or self._variant_game(idx, rid, rid))
             if local:
                 item = self._serialize_game(local)
             else:
@@ -10763,6 +10895,8 @@ class LudoBackend:
                     'has_cover': bool(rom.get('path_cover_small')),
                     'platform_slug': rom.get('platform_slug'),
                 }
+                if _no_server_file(rom):
+                    item['no_server_file'] = True
             # RomM's Home paints continue-playing cards with the game's
             # screenshot (landscape) and floats the box-art as a PIP. Carry the
             # first merged screenshot path so the frontend can do the same; the

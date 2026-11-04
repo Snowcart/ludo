@@ -25,6 +25,7 @@ import { EmulatorsPage } from "./emulators";
 import { BiosPage } from "./bios";
 import { DownloadsPage } from "./downloads";
 import { PlatformsPage } from "./platforms";
+import { RegionsPage } from "./regions";
 import { PlayTimePage } from "./playtime";
 import { _LS_REOPEN_HOME } from "../storage";
 import { lastLaunchedRomId } from "../launch";
@@ -1704,6 +1705,7 @@ export function LibraryRootPage() {
           {top === 'bios' && <BiosPage />}
           {top === 'downloads' && <DownloadsPage />}
           {top === 'platforms' && <PlatformsPage />}
+          {top === 'regions' && <RegionsPage />}
           {top === 'playtime' && <PlayTimePage />}
         </div>
       )}
@@ -2274,7 +2276,7 @@ export function LibraryGamesPage() {
   const syncJob = useBatchJob(group ? cacheKey(group.key) : null);
   const syncMissing = () => {
     if (!group || syncJob) return; // already running for this group
-    const missing = games.filter((g) => !g.is_downloaded).map((g) => ({ id: g.rom_id, name: g.name }));
+    const missing = games.filter((g) => !g.is_downloaded && !g.no_server_file).map((g) => ({ id: g.rom_id, name: g.name }));
     if (missing.length === 0) { toaster.toast({ title: 'Nothing to sync', body: 'All games are already downloaded' }); return; }
     // Started from this page, but the toast can land long after the user has
     // navigated away — so it still needs a way back to this collection.
@@ -2416,7 +2418,7 @@ export function LibraryGamesPage() {
   // destructive "Remove downloaded" arms on first select then commits on the
   // second — matching the game-tile delete affordance.
   const openActions = () => {
-    const missing = games.filter((g) => !g.is_downloaded).length;
+    const missing = games.filter((g) => !g.is_downloaded && !g.no_server_file).length;
     const downloaded = games.filter((g) => g.is_downloaded).length;
     showModal(
       <CollectionActionsModal

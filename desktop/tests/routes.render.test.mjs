@@ -52,6 +52,7 @@ const ROUTES = [
   { path: "/romm-sync-emulators", says: "Emulators" },
   { path: "/romm-sync-bios", says: "BIOS" },
   { path: "/romm-sync-platforms", says: "Platforms" },
+  { path: "/romm-sync-regions", says: "Region order" },
   { path: "/romm-sync-downloads", says: "No active downloads" },
   { path: "/romm-sync-config", says: "RomM Connection Setup" },
   { path: "/romm-sync-library", says: "Collections" },
