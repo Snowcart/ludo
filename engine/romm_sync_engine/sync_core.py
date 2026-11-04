@@ -1257,6 +1257,10 @@ def _is_own_appimage(name):
 # "Nintendo - Switch" all land on the same entry.
 # `args` is the argv after the executable; '{rom}' is replaced with the ROM path.
 # ---------------------------------------------------------------------------
+# Names the libretro PS2 core reports, which RetroArch uses for its per-core
+# folders: older and RetroDECK builds first, the current buildbot build second.
+PS2_CORE_NAMES = ('LRPS2', 'ParaLLEl PS2')
+
 STANDALONE_EMULATORS = {
     'eden': {
         'name': 'Eden',
@@ -8930,6 +8934,21 @@ class RetroArchInterface:
             # Not bare 'pico': that would also match the Sega Pico.
             'pico-8': ['retro8'],
             'pico8': ['retro8'],
+            # RomM's own names are often bare ("Dreamcast", "Wii"), which the
+            # exact map above does not hold.
+            'dreamcast': ['flycast', 'redream'],
+            'wii': ['dolphin'],
+            'gamecube': ['dolphin'],
+            'saturn': ['beetle_saturn', 'mednafen_saturn', 'yabasanshiro', 'yabause', 'kronos'],
+            'master system': ['genesis_plus_gx', 'picodrive'],
+            'game gear': ['genesis_plus_gx', 'picodrive'],
+            'sega cd': ['genesis_plus_gx', 'picodrive'],
+            '32x': ['picodrive'],
+            'super famicom': ['snes9x', 'bsnes', 'mesen-s'],
+            'arcade': ['fbneo', 'mame', 'fbalpha'],
+            'neo geo': ['fbneo', 'mame', 'fbalpha'],
+            'neo geo cd': ['neocd', 'fbneo'],
+            'neo geo pocket': ['beetle_ngp', 'mednafen_ngp'],
     }
 
     def standalone_emulator_status(self, platform_name, platform_slug=None):
@@ -9159,10 +9178,8 @@ class RetroArchInterface:
         # RetroArch keys per-game options by the core's DISPLAY name, which for
         # this core is its project name (LRPS2) rather than the library
         # filename (pcsx2_libretro.so) the rest of Ludo matches on.
-        opt_file = self._ps2_option_file(rom_path)
-        if not opt_file:
-            return
-        self._write_core_option(opt_file, self.PCSX2_BIOS_OPTION_KEY, bios)
+        for opt_file in self._ps2_option_files(rom_path):
+            self._write_core_option(opt_file, self.PCSX2_BIOS_OPTION_KEY, bios)
 
     # lrps2's option choosing between one card for everything and a card per
     # game. Its own description is "Use per-content or shared memory cards."
@@ -9190,22 +9207,22 @@ class RetroArchInterface:
         """
         if 'pcsx2' not in Path(core_path).name.lower():
             return
-        opt_file = self._ps2_option_file(rom_path)
-        if not opt_file:
-            return
-        self._write_core_option(opt_file, self.PCSX2_SHARED_CARDS_KEY, 'disabled')
+        for opt_file in self._ps2_option_files(rom_path):
+            self._write_core_option(opt_file, self.PCSX2_SHARED_CARDS_KEY, 'disabled')
 
-    def _ps2_option_file(self, rom_path):
-        """RetroArch's per-game core-options file for this ROM under lrps2.
+    def _ps2_option_files(self, rom_path):
+        """RetroArch's per-game core-options files for this ROM.
 
-        Keyed by the core's DISPLAY name, which for this core is its project
-        name (LRPS2) and not the library filename (pcsx2_libretro.so) that the
-        rest of Ludo matches cores on.
+        Keyed by the name the core reports at runtime, not the library filename
+        (pcsx2_libretro.so) Ludo matches cores on. RetroDECK's build reports
+        LRPS2 and the current buildbot one "ParaLLEl PS2", while its .info still
+        says LRPS2, so write both: RetroArch ignores the one it does not use.
         """
         cfg_dir = self.find_retroarch_config_dir()
         if not cfg_dir:
-            return None
-        return Path(cfg_dir) / 'config' / 'LRPS2' / f"{Path(rom_path).stem}.opt"
+            return []
+        return [Path(cfg_dir) / 'config' / name / f"{Path(rom_path).stem}.opt"
+                for name in PS2_CORE_NAMES]
 
     def _ps2_disc_region(self, rom_path, regions=None):
         """The region letter a PS2 disc needs ('A'/'E'/'J'/'H'), or ''.
@@ -14573,7 +14590,10 @@ class AutoSyncManager:
         folder = Path(saves_dir)
         mode = self.retroarch.get_save_subdir_mode('saves')
         if mode == 'core':
-            folder = folder / 'LRPS2'  # the core's display name, not pcsx2
+            # The core's reported name, which depends on the build. Only the
+            # build in use has made its folder.
+            folder = next((folder / n for n in reversed(PS2_CORE_NAMES)
+                           if (folder / n).is_dir()), folder / PS2_CORE_NAMES[0])
         elif mode == 'content' and local.name:
             folder = folder / local.parent.name
         return folder / f"{stem}.ps2"

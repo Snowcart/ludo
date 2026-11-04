@@ -659,6 +659,11 @@ def identify_upload(path):
             with zipfile.ZipFile(path) as archive:
                 names = [Path(m.filename).name.lower()
                          for m in archive.infolist() if not m.is_dir()]
+                # NCAs first: a firmware zip may carry its keys too, and
+                # install_firmware_zip installs both. Calling that 'keys' left
+                # the firmware uninstalled and the prompt coming back.
+                if any(n.endswith('.nca') for n in names):
+                    return 'firmware'
                 for member in archive.infolist():
                     if member.is_dir():
                         continue
@@ -667,8 +672,6 @@ def identify_upload(path):
                     with archive.open(member) as fh:
                         if looks_like_keys(fh.read(64 * 1024)):
                             return 'keys'
-                if any(n.endswith('.nca') for n in names):
-                    return 'firmware'
                 return None
         with open(path, 'rb') as fh:
             if looks_like_keys(fh.read(64 * 1024)):

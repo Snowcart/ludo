@@ -351,6 +351,12 @@ _NON_GAME_EXTS = (
 # when they are all there is, they are the game.
 _AMBIGUOUS_GAME_EXTS = ('.md',)
 
+# What must be unpacked before a core can boot it. The second line is Dolphin's:
+# it cannot read inside an archive, and handed one RetroArch just hangs.
+_DISC_IMAGE_EXTS = ('.cue', '.bin', '.iso', '.chd', '.gdi', '.cdi',
+                    '.mdf', '.nrg', '.ccd', '.img', '.pbp',
+                    '.wbfs', '.rvz', '.gcm', '.gcz', '.wia', '.ciso', '.tgc')
+
 # Disc dumps that describe their own tracks: the descriptor is the thing to
 # boot, and every other file in the folder belongs to it. Excludes .m3u, which
 # RomM also emits for multi-FILE regional ROMs that are not discs at all.
@@ -386,6 +392,10 @@ def _list_standalone_games(folder):
         if ext.startswith('.state'):
             continue
         games.append(f)
+    # An archive beside the game it unpacks to is not a second game.
+    unpacked = [f for f in games if f.suffix.lower() not in ('.zip', '.7z')]
+    if unpacked:
+        games = unpacked
     if not games:
         games = [f for f in folder.rglob('*')
                  if f.is_file() and f.suffix.lower() in _AMBIGUOUS_GAME_EXTS]
@@ -426,6 +436,11 @@ def _resolve_download_path(download_dir, platform_slug, file_name):
                          Path(download_dir) / folder / (stem + '__extracted')):
                 if is_path_validly_downloaded(cand):
                     return cand, True
+            # Unpacked by hand, with the archive then deleted.
+            for ext in _DISC_IMAGE_EXTS:
+                cand = Path(download_dir) / folder / (stem + ext)
+                if is_path_validly_downloaded(cand):
+                    return cand, True
     # Not downloaded — report where it *would* go, i.e. the ES-DE folder.
     return Path(download_dir) / folders[0] / file_name, False
 
@@ -447,6 +462,9 @@ def _detect_multi_disc(local_path, is_downloaded):
     if p.is_dir():
         launchable = [f for f in p.rglob('*')
                       if f.is_file() and f.suffix.lower() in _LAUNCHABLE_DISC_EXTS]
+        # One disc and RomM's one-line playlist is still one disc.
+        if sum(f.suffix.lower() != '.m3u' for f in launchable) == 1:
+            return False, 0
         if len(launchable) > 1:
             return True, len(launchable)
         # No disc set — fall back to standalone game files (regional variants).
@@ -4722,8 +4740,7 @@ class LudoBackend:
     # the core (block_extract lives inside the core binary, not any readable
     # metadata), so peeking the archive is both simpler and more accurate than
     # maintaining a core/platform table.
-    _DISC_IMAGE_EXTS = ('.cue', '.bin', '.iso', '.chd', '.gdi', '.cdi',
-                        '.mdf', '.nrg', '.ccd', '.img', '.pbp')
+    _DISC_IMAGE_EXTS = _DISC_IMAGE_EXTS
 
     def _archive_needs_extract(self, archive_path: Path) -> bool:
         """True when this archive must be unpacked for RetroArch to launch it.
@@ -7804,6 +7821,11 @@ class LudoBackend:
                     # could not be booted at all.
                     return [{'name': games[0].name, 'path': str(games[0]),
                              'is_m3u': False, 'is_region': False}]
+                # One disc: boot it, not RomM's one-line playlist. The PS2 core
+                # only follows a .cue when it is the content itself; through an
+                # .m3u the VM fails and RetroArch spins with no window.
+                if disc_images:
+                    return disc_images
             # Float the .m3u to the top so it is the default "all discs" entry.
             discs.sort(key=lambda d: (not d['is_m3u'], d['name'].lower()))
             return discs
@@ -7841,13 +7863,44 @@ class LudoBackend:
             return None
         return discs[0]['path']  # .m3u sorts first, else first disc
 
+    def _refresh_local_path(self, g):
+        """Re-derive a game's path when its file has gone, e.g. unpacked by hand.
+        Otherwise Play kept the old path until a restart re-read the disk."""
+        if not Path(g.get('local_path') or '').exists():
+            self._reconcile_downloads([g])
+
     async def _ready_to_boot(self, g, launch_path):
         """Decompress a still-compressed Switch file before it is launched.
 
         Normally done on download; this is the retry for a download whose
         decompression failed, so Play never hands Eden a file it cannot read.
+        An archive holding a disc image gets the same treatment, for a download
+        made before it was unpacked on arrival: no core can boot it as it is.
+
         Returns (path, None) or (None, the reason to show).
         """
+        archive = Path(launch_path or '')
+        if archive.suffix.lower() in ('.zip', '.7z') and archive.is_file():
+            # Already unpacked by hand beside the archive: use that, not a copy.
+            for ext in _DISC_IMAGE_EXTS:
+                sibling = archive.with_suffix(ext)
+                if sibling.is_file():
+                    return str(sibling), None
+            loop = asyncio.get_event_loop()
+            unpacked = await loop.run_in_executor(
+                None, self._maybe_unzip_download, archive, g.get('rom_id'))
+            self._download_progress.pop(g.get('rom_id'), None)
+            if Path(unpacked) == archive:
+                if self._archive_needs_extract(archive):
+                    return None, f"Could not unpack {archive.name}."
+                return launch_path, None
+            if Path(g.get('local_path') or '') == archive:
+                g['local_path'] = str(unpacked)
+                self._persist_snapshot_throttled()
+            resolved = self._resolve_launch_path(str(unpacked), None, g.get('platform_slug'))
+            if not resolved:
+                return None, f"Nothing launchable inside {archive.name}."
+            return resolved, None
         if not (launch_path and switch_nsz.is_compressed(launch_path)):
             return launch_path, None
         loop = asyncio.get_event_loop()
@@ -10994,6 +11047,9 @@ class LudoBackend:
                 return {'success': False, 'message': 'Game not downloaded'}
             if not self._retroarch:
                 return {'success': False, 'message': 'RetroArch not available'}
+            self._refresh_local_path(g)
+            if not g.get('local_path'):
+                return {'success': False, 'message': 'Game not downloaded'}
             # A bare Play resumes the remembered disc; an explicit pick overrides.
             effective_disc = disc or self._get_last_disc(effective_rom_id) or None
             launch_path = self._resolve_launch_path(g['local_path'], effective_disc, g.get('platform_slug'))
@@ -11942,6 +11998,10 @@ class LudoBackend:
                 # Regional/disc variants live on their parent, not in the index.
                 g = self._variant_game(idx, rom_id, effective_rom_id) or g
             if not g or not g.get('is_downloaded') or not g.get('local_path'):
+                return {'success': False, 'steam_host': False,
+                        'message': 'Game not downloaded'}
+            self._refresh_local_path(g)
+            if not g.get('local_path'):
                 return {'success': False, 'steam_host': False,
                         'message': 'Game not downloaded'}
             effective_disc = disc or self._get_last_disc(effective_rom_id) or None
