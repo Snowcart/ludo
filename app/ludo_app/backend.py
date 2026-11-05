@@ -11669,22 +11669,22 @@ class LudoBackend:
             if not core:
                 return {}          # no core at all — _core_gap owns that message
             entry = self._server_firmware().get(slug.lower()) or {}
-            wanted = [f['file_name'] for f in entry.get('files') or []]
+            wanted = [(f['file_name'], f['file_name']) for f in entry.get('files') or []]
             required = self._required_firmware_for_core(core)
             if not wanted:
                 # Nothing on the server to compare against (platform has no
                 # firmware uploaded, or we're offline) — fall back to the core's
                 # own required list so the check still works without RomM.
-                wanted = [desc or path for path, desc in required]
+                wanted = [(path, desc or path) for path, desc in required]
             if not wanted:
                 return {}
             rel, base = self._installed_bios_index()
             missing = []
-            for w in wanted:
-                key = w.replace('\\', '/').strip('/').lower()
+            for path, label in wanted:
+                key = path.replace('\\', '/').strip('/').lower()
                 if key in rel or ('/' not in key and key in base):
                     continue
-                missing.append(w)
+                missing.append(label)
             if not missing:
                 return {}
             return {'missing_bios': missing, 'core': core,

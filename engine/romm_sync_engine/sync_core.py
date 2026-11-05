@@ -8173,6 +8173,17 @@ class RetroArchInterface:
             return Path.home() / 'snap/retroarch/current/.config/retroarch'
         return Path.home() / '.config' / 'retroarch'
 
+    def _unconfigured_tree(self):
+        """The config tree of a RetroArch that hasn't run yet, or None.
+
+        RetroDECK sets itself up before it can launch anything, and on Windows
+        _install_tree's path means nothing, so neither is in this state.
+        """
+        if IS_WINDOWS or self.find_retroarch_config_dir():
+            return None
+        tree = self._install_tree()
+        return tree if tree and tree.name != 'retrodeck' else None
+
     def expected_bios_dir(self):
         """Where the DETECTED emulator looks for BIOS files, existing or not.
 
@@ -8269,7 +8280,7 @@ class RetroArchInterface:
         return str(library_dir() / ('roms' if kind == 'roms' else 'saves'))
 
     def ensure_save_dirs_exist(self):
-        """Create the emulator's saves/ and states/ folders now, not later.
+        """Create the emulator's saves/, states/ and system/ folders now, not later.
 
         Directory discovery only accepts folders that exist, and a freshly
         installed emulator has none until its first run — so the first session
@@ -8286,7 +8297,10 @@ class RetroArchInterface:
         if not expected:
             return made
         parent = Path(expected).parent
-        for d in (Path(expected), parent / 'states'):
+        dirs = [Path(expected), parent / 'states']
+        if self.expected_bios_dir():
+            dirs.append(Path(self.expected_bios_dir()))
+        for d in dirs:
             try:
                 if not d.is_dir():
                     d.mkdir(parents=True, exist_ok=True)
@@ -9334,7 +9348,9 @@ class RetroArchInterface:
         LRPS2 and the current buildbot one "ParaLLEl PS2", while its .info still
         says LRPS2, so write both: RetroArch ignores the one it does not use.
         """
-        cfg_dir = self.find_retroarch_config_dir()
+        # No retroarch.cfg before the first run, but an options file is safe to
+        # write then and the first session is the one that would use shared cards.
+        cfg_dir = self.find_retroarch_config_dir() or self._unconfigured_tree()
         if not cfg_dir:
             return []
         return [Path(cfg_dir) / 'config' / name / f"{Path(rom_path).stem}.opt"
@@ -9647,6 +9663,11 @@ class RetroArchInterface:
             combo = self._menu_toggle_combo()
             if combo:
                 lines.append(f'input_menu_toggle_gamepad_combo = "{combo}"')
+            # ensure_content_save_sorting can't run without a retroarch.cfg, so
+            # the first session gets the same two values here.
+            if self._unconfigured_tree():
+                lines += ['sort_savefiles_enable = "false"',
+                          'sort_savefiles_by_content_enable = "true"']
             overlay.write_text('\n'.join(lines) + '\n', encoding='utf-8')
             return str(overlay)
         except Exception as e:
@@ -10048,6 +10069,9 @@ class RetroArchInterface:
                 pass
             return mode
 
+        # The launch overlay decides this one for a RetroArch that hasn't run.
+        if save_type == 'saves' and self._unconfigured_tree():
+            return 'content'
         # No config yet. Guessing wrong puts the save where the emulator will
         # never read it, so use the best evidence available, in order.
         remembered = ''
@@ -19489,8 +19513,11 @@ class BiosTrackingManager:
                         self.platform_status[platform_slug]['missing'] = len(required_missing_after)
                         self.platform_status[platform_slug]['total_required'] = len(present_after) + len(required_missing_after)
             else:
-                error_msg = "unavailable_on_server"
-                self.log(f"⚠️ BIOS unavailable on server for {platform_name}")
+                # False also covers a local failure, with the files on the server.
+                local = not bios_manager.ensure_system_directory()
+                error_msg = "no_bios_folder" if local else "unavailable_on_server"
+                self.log(f"⚠️ No BIOS folder for {platform_name}" if local
+                         else f"⚠️ BIOS unavailable on server for {platform_name}")
                 with self._lock:
                     self.download_failures[platform_slug] = error_msg
 
