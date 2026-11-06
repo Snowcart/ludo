@@ -5158,7 +5158,8 @@ class LudoBackend:
             return {'success': True, 'available_cores': available, 'mappings': rows,
                     'can_download_cores': support['available'],
                     'download_unavailable_reason': support['reason'],
-                    'download_unavailable_kind': support.get('kind') or ''}
+                    'download_unavailable_kind': support.get('kind') or '',
+                    'core_list_unavailable': ra.core_index_unavailable()}
         except Exception as e:
             logging.error(f"get_core_mappings error: {e}", exc_info=True)
             return {'success': False, 'mappings': [], 'available_cores': [], 'message': str(e)}

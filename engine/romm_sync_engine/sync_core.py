@@ -1261,6 +1261,9 @@ def _is_own_appimage(name):
 # folders: older and RetroDECK builds first, the current buildbot build second.
 PS2_CORE_NAMES = ('LRPS2', 'ParaLLEl PS2')
 
+# How long a failed core list fetch stands before anything asks again.
+BUILDBOT_RETRY_SECONDS = 300
+
 STANDALONE_EMULATORS = {
     'eden': {
         'name': 'Eden',
@@ -7281,6 +7284,7 @@ class RetroArchInterface:
         self._retrodeck_core_map_cache = None
         # Cache for the libretro buildbot's downloadable-core listing (lazy).
         self._buildbot_index_cache = None
+        self._buildbot_index_failed_at = None
         self.retroarch_executable = None
         self.cores_dir = None
         self.save_dirs = {}
@@ -10642,9 +10646,18 @@ class RetroArchInterface:
         the post-extract integrity check in download_core(). Empty dict when
         offline or on an unsupported platform: callers treat "no downloadable
         cores" as a normal state, never an error.
+
+        A failed fetch is remembered for a few minutes: the core page asks once
+        per platform, and each retry against a blocked host cost a full timeout,
+        which read as "Loading cores..." forever. An expired list still on disk
+        stands in meanwhile.
         """
         if self._buildbot_index_cache is not None and not force_refresh:
             return self._buildbot_index_cache
+        failed_at = self._buildbot_index_failed_at
+        if (failed_at is not None and not force_refresh
+                and time.monotonic() - failed_at < BUILDBOT_RETRY_SECONDS):
+            return self._stale_core_index()
         base, ext = self._buildbot_base()
         if not base:
             self._buildbot_index_cache = {}
@@ -10663,7 +10676,7 @@ class RetroArchInterface:
 
         cores = {}
         try:
-            resp = requests.get(f'{base}/.index-extended', timeout=20)
+            resp = requests.get(f'{base}/.index-extended', timeout=(5, 20))
             resp.raise_for_status()
             suffix = f'_libretro{ext}.zip'
             for line in resp.text.splitlines():
@@ -10677,8 +10690,10 @@ class RetroArchInterface:
                                                'date': date}
         except Exception as e:
             print(f"⚠️ Could not fetch libretro core index: {e}")
-            return {}
+            self._buildbot_index_failed_at = time.monotonic()
+            return self._stale_core_index()
 
+        self._buildbot_index_failed_at = None
         try:
             cache_file.parent.mkdir(parents=True, exist_ok=True)
             cache_file.write_text(json.dumps(
@@ -10688,6 +10703,20 @@ class RetroArchInterface:
             pass
         self._buildbot_index_cache = cores
         return cores
+
+    def _stale_core_index(self):
+        """The last core list saved to disk, however old, or {}."""
+        base, _ext = self._buildbot_base()
+        try:
+            blob = json.loads((cache_dir() / 'libretro_core_index.json')
+                              .read_text(encoding='utf-8'))
+            return blob['cores'] if blob.get('base') == base else {}
+        except Exception:
+            return {}
+
+    def core_index_unavailable(self):
+        """True when the last try at the online core list failed."""
+        return self._buildbot_index_failed_at is not None
 
     def repair_retroarch_assets_dir(self):
         """Undo an assets_directory left pointing at an empty folder.
