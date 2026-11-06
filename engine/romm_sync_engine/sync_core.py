@@ -11467,7 +11467,10 @@ class RetroArchInterface:
             # round-trip to the verbatim suffix here.
             stripped_full = re.sub(timestamp_pattern, '', original_filename).strip()
             if stripped_full.lower().endswith('.state.auto'):
-                target_filename = stripped_full
+                # Argosy names its autosave slot in the file; RetroArch only reads
+                # "<content>.state.auto".
+                target_filename = re.sub(r'\.autosave(?=\.state\.auto$)', '',
+                                         stripped_full, flags=re.IGNORECASE)
             # Use slot info to determine correct state extension
             elif slot:
                 target_filename = self._state_filename_from_slot(base_name, slot)
@@ -13640,6 +13643,8 @@ class AutoSyncManager:
             # Find emulator from file path
             emulator_info = self.retroarch.get_emulator_info_from_path(file_path)
             emulator = emulator_info['romm_emulator']  # Use RomM-compatible name
+            if save_type == 'states' and not emulator:
+                emulator = self._state_emulator(file_path, rom_id)
 
             # Upload the file with thumbnail and emulator info
             slot_info = f" [slot={slot}, autocleanup={autocleanup_limit}]" if slot else ""
@@ -14457,7 +14462,8 @@ class AutoSyncManager:
             # saves. The card stays the thing that changed; the zip is what
             # the server sees.
             upload_path, file_name = path, entry['name']
-            if slugs.get(rom_id) == 'ps2' and path.suffix.lower() == '.ps2':
+            is_ps2_card = slugs.get(rom_id) == 'ps2' and path.suffix.lower() == '.ps2'
+            if is_ps2_card:
                 packed = self._pack_ps2_card(path, rom_id)
                 if packed is None:
                     continue
@@ -14475,7 +14481,8 @@ class AutoSyncManager:
                 updated_at = _dt.datetime.fromtimestamp(
                     max(m.stat().st_mtime for m in members),
                     tz=_dt.timezone.utc).isoformat()
-            content_hash = RomMClient.compute_content_hash(upload_path)
+            content_hash = (self._ps2_reported_hash(rom_id, upload_path) if is_ps2_card
+                            else RomMClient.compute_content_hash(upload_path))
 
             # Use the RomM core name (e.g. "Mupen64Plus-Next"), not the raw save
             # folder name (e.g. "n64"). get_save_files()' retroarch_emulator is
@@ -14697,6 +14704,84 @@ class AutoSyncManager:
                 return (g.get('platform_slug')
                         or (g.get('romm_data') or {}).get('platform_slug'))
         return None
+
+    def _state_emulator(self, path, rom_id):
+        """The core for a state in a flat folder, which names no emulator."""
+        game = next((g for g in (self.get_games() or []) if g.get('rom_id') == rom_id), {})
+        try:
+            return self.retroarch.describe_core_resolution(
+                game.get('platform'), system_slug=game.get('platform_slug')
+            ).get('resolved_core')
+        except Exception as e:
+            logging.debug(f"no core for {Path(path).name}: {e}")
+            return None
+
+    def _is_ps2_card_op(self, op):
+        """A server save that is a whole PS2 card, as Argosy's built-in core uploads."""
+        return (str(op.get('file_name') or '').lower().endswith('.ps2')
+                and self._platform_slug_of(op.get('rom_id')) == 'ps2')
+
+    @staticmethod
+    def _ps2_baseline_file(rom_id):
+        return cache_dir() / 'ps2_saves' / str(rom_id) / 'server_card.json'
+
+    def _ps2_reported_hash(self, rom_id, packed):
+        """The hash to tell RomM for this packed card.
+
+        After a whole card is restored the server knows the card's hash, not the
+        zip's. While the card still packs to the zip it restored to, it is that
+        same save, so report the server's hash or it looks like new progress.
+        """
+        own = RomMClient.compute_content_hash(packed)
+        try:
+            baseline = json.loads(self._ps2_baseline_file(rom_id).read_text())
+            if baseline.get('zip') == own:
+                return baseline.get('server') or own
+        except (OSError, ValueError, AttributeError):
+            pass
+        return own
+
+    def _restore_ps2_card(self, op, device_id, session_id):
+        """Put a whole PS2 card from the server in place of the game's card.
+
+        Same rules as _restore_ps2_save: deferred while RetroArch runs, and the
+        previous card is kept as "<card>.backup".
+        """
+        file_name = op.get('file_name') or ''
+        if self.is_retroarch_running():
+            self.log(f"ℹ️ Save-sync: RetroArch is running; {file_name} will "
+                     f"restore once it is closed.")
+            return False
+        card_path = self._ps2_card_path(op, (self.retroarch.save_dirs or {}).get('saves'))
+        if not card_path:
+            self.log(f"⚠️ Save-sync: no memory card location for {file_name}")
+            return False
+        staged = cache_dir() / 'incoming_saves' / file_name
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        if not self.romm_client.download_save_by_id(
+                op.get('save_id'), 'saves', staged,
+                device_id=device_id, session_id=session_id):
+            return False
+        try:
+            ps2_memcard.Card.open(staged)
+            server_hash = RomMClient.compute_content_hash(staged)
+            card_path.parent.mkdir(parents=True, exist_ok=True)
+            if card_path.is_file():
+                shutil.copy2(card_path, str(card_path) + '.backup')
+            shutil.copyfile(staged, card_path)
+        except (ps2_memcard.CardError, OSError) as e:
+            self.log(f"⚠️ Save-sync: could not restore {file_name}: {e}")
+            return False
+        finally:
+            staged.unlink(missing_ok=True)
+        self.log(f"✅ Restored memory card {card_path.name}")
+        self._record_synced(str(card_path))
+        restored = self._pack_ps2_card(card_path, op.get('rom_id'))
+        if restored:
+            self._ps2_baseline_file(op.get('rom_id')).write_text(json.dumps({
+                'zip': RomMClient.compute_content_hash(restored), 'server': server_hash}))
+            self._record_synced(str(restored))
+        return True
 
     def _is_ps2_zip_op(self, op):
         """A server save that is a PS2 game's folders rather than a whole card."""
@@ -16295,6 +16380,13 @@ class AutoSyncManager:
                             except Exception:
                                 pass
                         target = self._resolve_download_target(op, saves_dir)
+                        if target is None and self._is_ps2_card_op(op):
+                            if self._restore_ps2_card(op, device_id, session_id):
+                                summary['downloaded'] += 1
+                                _bump(rom_id, 'down')
+                            else:
+                                summary['deferred'] = summary.get('deferred', 0) + 1
+                            continue
                         if target is None or target is DEFER_DOWNLOAD:
                             # Nowhere RetroArch reads to put it yet; the
                             # conflict stands until the game is launched.
@@ -16462,6 +16554,8 @@ class AutoSyncManager:
         """
         if self._is_ps2_zip_op(op):
             return self._restore_ps2_save(op, device_id, session_id)
+        if self._is_ps2_card_op(op):
+            return self._restore_ps2_card(op, device_id, session_id)
         if self._is_gci_op(op):
             return self._restore_gci_save(op, device_id, session_id)
         if self._is_folder_op(op):
@@ -16605,7 +16699,8 @@ class AutoSyncManager:
             return None
         # A PS2 save zip is folders to merge into a card, not a file to drop;
         # a GameCube save is files for a card folder only its restore finds.
-        if self._is_ps2_zip_op(op) or self._is_gci_op(op) or self._is_folder_op(op):
+        if (self._is_ps2_zip_op(op) or self._is_ps2_card_op(op)
+                or self._is_gci_op(op) or self._is_folder_op(op)):
             return None
         # The op's emulator is the SERVER save's label, which a buggy or
         # foreign upload can set to anything ('switch' instead of 'eden'). The
@@ -17894,7 +17989,7 @@ class AutoSyncManager:
                     # the game's card instead, unless this device already
                     # holds that version.
                     if (_platform_slug == 'ps2'
-                            and original_filename.lower().endswith('.zip')):
+                            and original_filename.lower().endswith(('.zip', '.ps2'))):
                         device_id = self.settings.get('Device', 'device_id', '') or None
                         current = any(
                             sync.get('device_id') == device_id and sync.get('is_current')
@@ -17911,13 +18006,16 @@ class AutoSyncManager:
                             packed = (self._pack_ps2_card(card, rom_id)
                                       if card and card.is_file() else None)
                             current = bool(packed) and (
-                                RomMClient.compute_content_hash(packed)
+                                self._ps2_reported_hash(rom_id, packed)
                                 == latest_save.get('content_hash'))
                         if current:
                             skipped_count += 1
                         else:
                             downloads_attempted += 1
-                            if self._restore_ps2_save(
+                            restore = (self._restore_ps2_card
+                                       if original_filename.lower().endswith('.ps2')
+                                       else self._restore_ps2_save)
+                            if restore(
                                     {'rom_id': rom_id, 'file_name': original_filename,
                                      'save_id': latest_save.get('id'),
                                      'emulator': romm_emulator},
