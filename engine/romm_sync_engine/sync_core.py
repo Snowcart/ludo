@@ -8005,6 +8005,11 @@ class RetroArchInterface:
             'cores_dir': str(self.cores_dir or ''),
             'core_count': len(cores),
             'save_dirs': {k: str(v) for k, v in (self.save_dirs or {}).items()},
+            # A real folder here wins over Ludo's own setting (see
+            # align_retroarch_config), so the UI shows it instead of offering a
+            # choice that would have no effect. RetroDECK manages its own config.
+            'retroarch_save_dir': ('' if kind == 'retrodeck'
+                                   else self._retroarch_cfg_value('savefile_directory')),
             'bios_dir': str((self.bios_manager and self.bios_manager.system_dir) or ''),
             'stale_paths': self.stale_emulator_paths(),
             # Standalone emulators, which are a separate axis from 'installed'
