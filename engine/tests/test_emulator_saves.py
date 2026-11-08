@@ -167,8 +167,11 @@ def main():
         # to exercise the state that actually shipped.
         import shutil, subprocess
         fake = d / 'edenfake'
+        # argv[0] stays "sleep": where sleep is a multi-call coreutils
+        # binary it picks the tool from argv[0], and a renamed copy exits at
+        # once. The process name still comes from the file, edenfake.
         shutil.copy('/bin/sleep', fake)
-        proc = subprocess.Popen([str(fake), '30'],
+        proc = subprocess.Popen(['sleep', '30'], executable=str(fake),
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         try:
             time.sleep(0.5)
