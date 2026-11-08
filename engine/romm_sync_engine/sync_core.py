@@ -14505,6 +14505,8 @@ class AutoSyncManager:
             # A GameCube game's GCIs are one save, packed the way Argosy packs
             # them; the unit is reported once, dated by its newest member.
             if path.suffix.lower() == gamecube_saves.GCI_SUFFIX:
+                if not gamecube_saves.in_card(path):
+                    continue
                 members = gamecube_saves.unit_members(path)
                 unit = (str(path.parent), gamecube_saves.game_code(path))
                 if unit in gci_units:
@@ -14652,6 +14654,7 @@ class AutoSyncManager:
         for entry in (self.retroarch.get_save_files() or {}).get('saves', []):
             path = Path(entry['path'])
             if (path.suffix.lower() == gamecube_saves.GCI_SUFFIX
+                    and gamecube_saves.in_card(path)
                     and self.rom_id_for_save(path) == rom_id):
                 return RomMClient.compute_content_hash(
                     self._pack_gci_unit(gamecube_saves.unit_members(path), rom_id))
@@ -14673,6 +14676,7 @@ class AutoSyncManager:
         for entry in (self.retroarch.get_save_files() or {}).get('saves', []):
             path = Path(entry['path'])
             if (path.suffix.lower() == gamecube_saves.GCI_SUFFIX
+                    and gamecube_saves.in_card(path)
                     and gamecube_saves.game_code(path) == code):
                 return path.parent
         if not saves_dir:
